@@ -44,6 +44,7 @@
   .row button { flex: 1 0 auto; }
   label.line { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 8px 0; font-size: 14px; }
   select, input[type=range] { font: inherit; }
+  #ttKey { flex: 1; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 40px; font: inherit; font-size: 16px; }
   select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 40px; }
   input[type=range] { width: 100%; }
   #log { margin-top: 10px; font-size: 12px; color: var(--dim); min-height: 18px; }
@@ -91,7 +92,11 @@
       <button data-limit="80">80</button><button data-limit="100">100</button>
       <button data-limit="120">120</button><button data-limit="140">140</button>
     </div>
-    <p class="note">Auto looks up the road's limit from OpenStreetMap using GPS. Tap a number to set it yourself.</p>
+    <p class="note">Auto looks up the road's limit by GPS. Tap a number to set it yourself.</p>
+    <label class="line">TomTom key
+      <input id="ttKey" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="paste key here">
+    </label>
+    <p class="note">Optional. With a free TomTom key the limit comes from TomTom's navigation map, which is usually more complete than OpenStreetMap. The key stays on this phone.</p>
   </section>
 
   <section>
@@ -200,6 +205,14 @@ function parseMaxspeed(v) {
   return Math.round(m[2] ? parseFloat(m[1]) * 1.609 : parseFloat(m[1]));
 }
 
+// TomTom speed limit text such as "80.00KPH" or "30.00MPH" -> km/h, or null.
+function parseTomTomLimit(v) {
+  const m = /^(\d+(?:\.\d+)?)\s*(KPH|MPH)$/i.exec(String(v == null ? '' : v).trim());
+  if (!m) return null;
+  const n = parseFloat(m[1]); if (!(n > 0)) return null;
+  return Math.round(/mph/i.test(m[2]) ? n * 1.609 : n);
+}
+
 // Finds which road the car is on: the closest drivable road whose direction matches the
 // direction of travel. This stops a side road or a road crossing overhead being picked.
 const DRIVABLE = ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'motorway_link', 'trunk_link',
@@ -254,7 +267,7 @@ if (typeof document !== 'undefined') (function () {
     running: false, camera: false, model: null,
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
     hist: [], camLight: 'none',
-    manualLimit: null, mapLimit: null, mapRoad: null, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
+    manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
     margin: 5, minBox: 0.01, yellowAlarm: true,
     test: false, testSpeed: 0, testLight: 'camera',
   };
@@ -299,8 +312,8 @@ if (typeof document !== 'undefined') (function () {
     $('speedSub').textContent = S.test ? 'km/h (test)' : speed == null ? 'waiting for GPS' :
       'km/h' + (S.gpsAcc != null ? ' ±' + Math.round(S.gpsAcc) + ' m' : '');
     $('limitVal').textContent = limit == null ? '--' : limit;
-    $('limitSub').textContent = S.manualLimit != null ? 'set by you' : S.mapLimit != null ? 'map: ' + S.mapRoad
-      : S.mapRoad ? 'no limit on map: ' + S.mapRoad : 'road not found';
+    $('limitSub').textContent = S.manualLimit != null ? 'set by you' : S.mapLimit != null ? S.mapSrc + ': ' + S.mapRoad
+      : S.mapRoad ? 'no limit on map: ' + S.mapRoad : S.ttError ? 'TomTom key not accepted' : 'road not found';
     const lv = $('lightVal');
     lv.textContent = light === 'none' ? '--' : light[0].toUpperCase() + light.slice(1);
     lv.className = 'val ' + light;
@@ -343,13 +356,32 @@ if (typeof document !== 'undefined') (function () {
     if (S.lookupBusy) return;
     if (S.lastLookup && haversine(S.lastLookup, fix) < 80 && fix.t - S.lastLookup.t < 15000) return;
     S.lookupBusy = true; S.lastLookup = fix;
-    try {
+    let found = false;
+    if (S.ttKey) {                                   // 1) TomTom navigation map, if a key is set
+      try {
+        const u = 'https://api.tomtom.com/search/2/reverseGeocode/' + fix.lat.toFixed(6) + ',' + fix.lon.toFixed(6) +
+          '.json?key=' + encodeURIComponent(S.ttKey) + '&returnSpeedLimit=true&radius=40' +
+          (S.heading != null ? '&heading=' + S.heading.toFixed(1) : '');
+        const r = await fetch(u);
+        S.ttError = r.status === 401 || r.status === 403;
+        if (r.ok) {
+          const a = (((await r.json()).addresses || [])[0] || {}).address || {};
+          const limit = parseTomTomLimit(a.speedLimit);
+          if (limit != null) {
+            S.mapLimit = limit; S.mapSrc = 'TomTom';
+            S.mapRoad = (a.routeNumbers && a.routeNumbers[0]) || a.streetName || a.street || 'road';
+            found = true;
+          }
+        }
+      } catch (e) { /* offline: fall through */ }
+    }
+    if (!found) try {                                // 2) OpenStreetMap
       const q = '[out:json][timeout:8];way(around:40,' + fix.lat.toFixed(6) + ',' + fix.lon.toFixed(6) +
         ')[highway];out tags geom;';
       const r = await fetch('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q));
       if (r.ok) {
         const m = matchRoad((await r.json()).elements, fix, S.heading);
-        S.mapLimit = m ? m.limit : null; S.mapRoad = m ? m.road : null;
+        S.mapLimit = m ? m.limit : null; S.mapRoad = m ? m.road : null; S.mapSrc = 'map';
       }
     } catch (e) { /* offline or blocked: keep last value */ }
     S.lookupBusy = false;
@@ -531,6 +563,12 @@ if (typeof document !== 'undefined') (function () {
     const old = video.srcObject; if (old) old.getTracks().forEach(t => t.stop());
     try { video.srcObject = await openChosenCamera(); await video.play(); S.hist = []; fitStage(); }
     catch (err) { log('Could not switch camera: ' + (err.message || err)); }
+  });
+  try { S.ttKey = localStorage.getItem('ctw-ttkey') || ''; } catch (e) {}
+  $('ttKey').value = S.ttKey;
+  $('ttKey').addEventListener('change', e => {
+    S.ttKey = e.target.value.trim(); S.ttError = false; S.lastLookup = null;   // look up again straight away
+    try { localStorage.setItem('ctw-ttkey', S.ttKey); } catch (err) {}
   });
   function setYellow(on) {
     S.yellowAlarm = on; $('yellowBtn').textContent = on ? 'On' : 'Off'; $('yellowBtn').classList.toggle('on', on);
