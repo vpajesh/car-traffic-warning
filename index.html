@@ -104,8 +104,8 @@
     </label>
     <label class="line">Traffic light distance
       <select id="distSel">
-        <option value="0.02">Far (warns early)</option><option value="0.035" selected>Medium</option>
-        <option value="0.06">Near (warns late)</option>
+        <option value="0.01" selected>Far (warns early)</option><option value="0.025">Medium</option>
+        <option value="0.05">Near (warns late)</option>
       </select>
     </label>
     <label class="line">Test mode (no driving needed)
@@ -206,7 +206,7 @@ if (typeof document !== 'undefined') (function () {
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
     hist: [], camLight: 'none',
     manualLimit: null, mapLimit: null, lastLookup: null, lookupBusy: false,
-    margin: 5, minBox: 0.035,
+    margin: 5, minBox: 0.01,
     test: false, testSpeed: 0, testLight: 'camera',
   };
 
@@ -317,7 +317,7 @@ if (typeof document !== 'undefined') (function () {
   async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('no camera access');
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
+      audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
     });
     video.srcObject = stream; await video.play();
     S.camera = true; $('stageMsg').classList.add('hide');
@@ -332,26 +332,36 @@ if (typeof document !== 'undefined') (function () {
     video.srcObject = null; S.camera = false; octx.clearRect(0, 0, overlay.width, overlay.height);
   }
 
+  // Runs the detector on one region of the camera picture. Small regions act as a zoom,
+  // so a distant light fills more of what the detector sees.
+  async function detectRegion(sx, sy, sw, sh, vh, boxes) {
+    if (work.width !== sw || work.height !== sh) { work.width = sw; work.height = sh; }
+    wctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+    const preds = await S.model.detect(work, 20, 0.2);
+    for (const p of preds) {
+      if (p.class !== 'traffic light') continue;
+      const x = Math.max(0, Math.floor(p.bbox[0])), y = Math.max(0, Math.floor(p.bbox[1]));
+      const w = Math.min(sw - x, Math.ceil(p.bbox[2])), h = Math.min(sh - y, Math.ceil(p.bbox[3]));
+      if (w < 2 || h < 2) continue;
+      const colour = classifyColour(wctx.getImageData(x, y, w, h).data);
+      boxes.push({ x: sx + x, y: sy + y, w, h, colour, far: Math.max(w, h) / vh < S.minBox });
+    }
+  }
+
+  let cycle = 0;
   async function detectLoop() {
     if (!S.running) return;
     try {
       if (S.model && S.camera && video.readyState >= 2 && video.videoWidth) {
-        const vw = video.videoWidth, vh = video.videoHeight;
-        const ch = Math.round(vh * 0.7);              // lights are in the upper part of the view
-        if (work.width !== vw || work.height !== ch) { work.width = vw; work.height = ch; }
-        wctx.drawImage(video, 0, 0, vw, ch, 0, 0, vw, ch);
-        const preds = await S.model.detect(work, 20, 0.25);
-        const boxes = []; let best = null;
-        for (const p of preds) {
-          if (p.class !== 'traffic light') continue;
-          let x = Math.max(0, Math.floor(p.bbox[0])), y = Math.max(0, Math.floor(p.bbox[1]));
-          let w = Math.min(vw - x, Math.ceil(p.bbox[2])), h = Math.min(ch - y, Math.ceil(p.bbox[3]));
-          if (w < 2 || h < 2) continue;
-          const colour = classifyColour(wctx.getImageData(x, y, w, h).data);
-          const far = Math.max(w, h) / vh < S.minBox;
-          boxes.push({ x, y, w, h, colour, far });
-          if (!far && colour !== 'none' && (!best || w * h > best.area)) best = { colour, area: w * h };
-        }
+        const vw = video.videoWidth, vh = video.videoHeight, boxes = [];
+        const R = f => Math.round(f);
+        // 1) whole view (upper 70%): nearby lights
+        await detectRegion(0, 0, vw, R(vh * 0.7), vh, boxes);
+        // 2) zoomed centre, alternating 2x and 3x: distant lights near the horizon
+        if (cycle++ % 2 === 0) await detectRegion(R(vw * 0.25), R(vh * 0.10), R(vw * 0.5), R(vh * 0.45), vh, boxes);
+        else await detectRegion(R(vw * 0.33), R(vh * 0.17), R(vw * 0.34), R(vh * 0.31), vh, boxes);
+        let best = null;
+        for (const b of boxes) if (!b.far && b.colour !== 'none' && (!best || b.w * b.h > best.area)) best = { colour: b.colour, area: b.w * b.h };
         S.hist.push(best ? best.colour : 'none'); if (S.hist.length > 4) S.hist.shift();
         S.camLight = smoothLight(S.hist);
         if (overlay.width !== vw || overlay.height !== vh) { overlay.width = vw; overlay.height = vh; }
@@ -363,7 +373,7 @@ if (typeof document !== 'undefined') (function () {
         }
       }
     } catch (e) { log('Detector error: ' + e.message); }
-    setTimeout(detectLoop, 150);
+    setTimeout(detectLoop, 60);
   }
 
   /* ---------- start / stop ---------- */
