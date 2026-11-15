@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Car Traffic Warning</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #171c24; --line: #2a323e; --text: #e8ecf1; --dim: #8b96a5;
+    --red: #ff4d4d; --amber: #ffb020; --green: #2fd67a; --blue: #4da3ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 560px; margin: 0 auto; padding: 12px; }
+  h1 { font-size: 18px; margin: 4px 0 10px; font-weight: 650; }
+  #stage { position: relative; background: #000; border-radius: 12px; overflow: hidden;
+    aspect-ratio: 4 / 3; border: 1px solid var(--line); }
+  #stage video, #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #stageMsg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 20px; color: var(--dim); font-size: 14px; }
+  #banner { margin: 10px 0; border-radius: 12px; padding: 14px; text-align: center;
+    font-weight: 700; font-size: 20px; letter-spacing: .02em; background: var(--panel);
+    border: 1px solid var(--line); color: var(--dim); }
+  #banner.red { background: var(--red); color: #fff; border-color: var(--red); animation: flash .5s steps(2) infinite; }
+  #banner.speed { background: var(--amber); color: #1a1200; border-color: var(--amber); animation: flash .8s steps(2) infinite; }
+  #banner.ok { color: var(--green); }
+  @keyframes flash { 50% { opacity: .55; } }
+  .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px; text-align: center; }
+  .tile .lab { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+  .tile .val { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .tile .sub { font-size: 11px; color: var(--dim); min-height: 15px; }
+  #lightVal.red { color: var(--red); } #lightVal.yellow { color: var(--amber); } #lightVal.green { color: var(--green); }
+  button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px; min-height: 44px; }
+  button.on { background: var(--blue); border-color: var(--blue); color: #04111f; font-weight: 650; }
+  #startBtn { width: 100%; margin-top: 10px; font-size: 18px; font-weight: 700; background: var(--green);
+    border-color: var(--green); color: #04160c; min-height: 54px; }
+  #startBtn.stop { background: var(--panel); border-color: var(--line); color: var(--text); }
+  section { margin-top: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px; }
+  section h2 { font-size: 13px; margin: 0 0 8px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .row button { flex: 1 0 auto; }
+  label.line { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 8px 0; font-size: 14px; }
+  select, input[type=range] { font: inherit; }
+  select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 40px; }
+  input[type=range] { width: 100%; }
+  #log { margin-top: 10px; font-size: 12px; color: var(--dim); min-height: 18px; }
+  .hide { display: none !important; }
+  .note { font-size: 12px; color: var(--dim); margin: 6px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Car Traffic Warning</h1>
+
+  <div id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+    <div id="stageMsg">Mount the phone so the rear camera faces the road, then press Start.</div>
+  </div>
+
+  <div id="banner">Not running</div>
+
+  <div class="tiles">
+    <div class="tile"><div class="lab">Speed</div><div class="val" id="speedVal">--</div><div class="sub" id="speedSub">km/h</div></div>
+    <div class="tile"><div class="lab">Limit</div><div class="val" id="limitVal">--</div><div class="sub" id="limitSub">not set</div></div>
+    <div class="tile"><div class="lab">Light</div><div class="val" id="lightVal">--</div><div class="sub" id="lightSub">&nbsp;</div></div>
+  </div>
+
+  <button id="startBtn">Start</button>
+  <div id="log"></div>
+
+  <section>
+    <h2>Speed limit</h2>
+    <div class="row" id="limitRow">
+      <button data-limit="auto" class="on">Auto (map)</button>
+      <button data-limit="40">40</button><button data-limit="60">60</button>
+      <button data-limit="80">80</button><button data-limit="100">100</button>
+      <button data-limit="120">120</button><button data-limit="140">140</button>
+    </div>
+    <p class="note">Auto looks up the road's limit from OpenStreetMap using GPS. Tap a number to set it yourself.</p>
+  </section>
+
+  <section>
+    <h2>Settings</h2>
+    <label class="line">Speed alarm margin
+      <select id="marginSel">
+        <option value="0">0 km/h over</option><option value="5" selected>5 km/h over</option>
+        <option value="10">10 km/h over</option><option value="20">20 km/h over</option>
+      </select>
+    </label>
+    <label class="line">Traffic light distance
+      <select id="distSel">
+        <option value="0.02">Far (warns early)</option><option value="0.035" selected>Medium</option>
+        <option value="0.06">Near (warns late)</option>
+      </select>
+    </label>
+    <label class="line">Test mode (no driving needed)
+      <button id="testBtn">Off</button>
+    </label>
+    <div id="testPanel" class="hide">
+      <label class="line">Test speed: <span id="testSpeedLab">0 km/h</span></label>
+      <input type="range" id="testSpeed" min="0" max="160" step="1" value="0">
+      <div class="row" id="testLightRow" style="margin-top:8px">
+        <button data-light="camera" class="on">Camera</button>
+        <button data-light="red">Red</button><button data-light="yellow">Yellow</button>
+        <button data-light="green">Green</button><button data-light="none">None</button>
+      </div>
+    </div>
+  </section>
+
+  <p class="note">Driver aid only. It can miss or misread lights and limits. Always watch the road yourself and do not touch the phone while driving.</p>
+</main>
+
+<script>
+/* ===== PURE LOGIC (tested separately) ===== */
+const STOP_KMH = 3; // below this the car counts as stopped (GPS jitters when still)
+
+// Alarm rules. Returns 'red', 'speed' or null.
+function decide(s) {
+  if (s.speed == null || s.speed < STOP_KMH) return null;           // stopped or unknown: no alarm
+  if (s.light === 'red' || s.light === 'yellow') return 'red';        // moving at a red/yellow light
+  if (s.limit != null && s.speed > s.limit + s.margin) return 'speed'; // over the limit
+  return null;
+}
+
+// Counts bright, saturated pixels by hue inside a detected traffic light box.
+function classifyColour(data) {
+  let red = 0, yellow = 0, green = 0;
+  const n = data.length / 4;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    if (max < 0.6 || d / max < 0.45) continue;   // lit lamps are bright and colourful
+    let h;
+    if (max === r) h = ((g - b) / d) % 6; else if (max === g) h = (b - r) / d + 2; else h = (r - g) / d + 4;
+    h *= 60; if (h < 0) h += 360;
+    if (h < 18 || h > 335) red++;
+    else if (h >= 18 && h < 70) yellow++;
+    else if (h >= 80 && h <= 200) green++;
+  }
+  const best = Math.max(red, yellow, green);
+  if (best < n * 0.015 || best < 4) return 'none';
+  return best === red ? 'red' : best === yellow ? 'yellow' : 'green';
+}
+
+// Smooths the last few detections so one bad frame does not trigger or cancel the alarm.
+function smoothLight(hist) {
+  const c = { red: 0, yellow: 0, green: 0 };
+  for (const h of hist) if (h in c) c[h]++;
+  if (c.red + c.yellow >= 2) return c.red >= c.yellow ? 'red' : 'yellow';
+  if (c.green >= 2) return 'green';
+  return 'none';
+}
+
+// OpenStreetMap maxspeed tag -> km/h, or null.
+function parseMaxspeed(v) {
+  if (!v) return null;
+  const m = /^(\d+(?:\.\d+)?)\s*(mph)?$/i.exec(String(v).trim());
+  if (!m) return null;
+  return Math.round(m[2] ? parseFloat(m[1]) * 1.609 : parseFloat(m[1]));
+}
+
+// Picks the limit of the most major road among nearby ways.
+const ROAD_RANK = ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'motorway_link', 'trunk_link',
+  'primary_link', 'secondary_link', 'tertiary_link', 'unclassified', 'residential', 'living_street', 'service'];
+function pickLimit(elements) {
+  let best = null, bestRank = 999;
+  for (const e of elements || []) {
+    const t = e.tags || {}, v = parseMaxspeed(t.maxspeed);
+    if (v == null) continue;
+    let rank = ROAD_RANK.indexOf(t.highway); if (rank < 0) rank = 500;
+    if (rank < bestRank) { bestRank = rank; best = v; }
+  }
+  return best;
+}
+
+function haversine(a, b) { // metres
+  const R = 6371000, rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad, dLon = (b.lon - a.lon) * rad;
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+/* ===== END PURE LOGIC ===== */
+
+if (typeof document !== 'undefined') (function () {
+  const $ = id => document.getElementById(id);
+  const video = $('video'), overlay = $('overlay'), octx = overlay.getContext('2d');
+  const work = document.createElement('canvas'), wctx = work.getContext('2d', { willReadFrequently: true });
+
+  const S = {
+    running: false, camera: false, model: null,
+    gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
+    hist: [], camLight: 'none',
+    manualLimit: null, mapLimit: null, lastLookup: null, lookupBusy: false,
+    margin: 5, minBox: 0.035,
+    test: false, testSpeed: 0, testLight: 'camera',
+  };
+
+  const log = msg => { $('log').textContent = msg; };
+
+  /* ---------- sound ---------- */
+  let actx = null, beepTimer = null, beepKind = null;
+  function beep(freq, dur, type) {
+    if (!actx) return;
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'square'; o.frequency.value = freq; g.gain.value = 0.3;
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  }
+  function setAlarm(kind) {
+    if (kind === beepKind) return;
+    beepKind = kind; clearInterval(beepTimer); beepTimer = null;
+    if (!kind) return;
+    const fn = kind === 'red'
+      ? () => { beep(980, 0.14, 'square'); if (navigator.vibrate) navigator.vibrate(120); }
+      : () => { beep(520, 0.18, 'sine'); setTimeout(() => beep(700, 0.18, 'sine'), 220); };
+    fn(); beepTimer = setInterval(fn, kind === 'red' ? 280 : 900);
+  }
+
+  /* ---------- current values ---------- */
+  function currentSpeed() {
+    if (S.test) return S.testSpeed;
+    if (S.gpsSpeed == null || Date.now() - S.gpsAt > 6000) return null;
+    return S.gpsSpeed;
+  }
+  function currentLight() {
+    if (S.test && S.testLight !== 'camera') return S.testLight;
+    return S.camLight;
+  }
+  function currentLimit() { return S.manualLimit != null ? S.manualLimit : S.mapLimit; }
+
+  /* ---------- screen ---------- */
+  function render() {
+    const speed = currentSpeed(), light = currentLight(), limit = currentLimit();
+    $('speedVal').textContent = speed == null ? '--' : Math.round(speed);
+    $('speedSub').textContent = S.test ? 'km/h (test)' : speed == null ? 'waiting for GPS' :
+      'km/h' + (S.gpsAcc != null ? ' ±' + Math.round(S.gpsAcc) + ' m' : '');
+    $('limitVal').textContent = limit == null ? '--' : limit;
+    $('limitSub').textContent = S.manualLimit != null ? 'set by you' : S.mapLimit != null ? 'from map' : 'not found';
+    const lv = $('lightVal');
+    lv.textContent = light === 'none' ? '--' : light[0].toUpperCase() + light.slice(1);
+    lv.className = 'val ' + light;
+    $('lightSub').innerHTML = (S.test && S.testLight !== 'camera') ? 'test' : S.camera ? 'camera' : 'no camera';
+
+    const b = $('banner');
+    if (!S.running) { b.className = ''; b.textContent = 'Not running'; setAlarm(null); return; }
+    const alarm = decide({ speed, light, limit, margin: S.margin });
+    if (alarm === 'red') { b.className = 'red'; b.textContent = (light === 'red' ? 'RED' : 'YELLOW') + ' LIGHT - STOP'; }
+    else if (alarm === 'speed') { b.className = 'speed'; b.textContent = 'SLOW DOWN - LIMIT ' + limit; }
+    else { b.className = 'ok'; b.textContent = speed != null && speed < STOP_KMH ? 'Stopped' : 'OK'; }
+    setAlarm(alarm);
+  }
+
+  /* ---------- GPS ---------- */
+  let watchId = null;
+  function startGps() {
+    if (!navigator.geolocation) { log('This browser has no GPS access.'); return; }
+    watchId = navigator.geolocation.watchPosition(pos => {
+      const c = pos.coords, fix = { lat: c.latitude, lon: c.longitude, t: pos.timestamp };
+      let kmh = null;
+      if (c.speed != null && c.speed >= 0) kmh = c.speed * 3.6;
+      else if (S.lastFix && fix.t > S.lastFix.t) {
+        const dt = (fix.t - S.lastFix.t) / 1000, d = haversine(S.lastFix, fix);
+        if (dt >= 0.5 && dt < 10) kmh = d > (c.accuracy || 10) * 0.5 ? (d / dt) * 3.6 : 0;
+      }
+      if (kmh != null) { S.gpsSpeed = kmh; S.gpsAt = Date.now(); }
+      S.gpsAcc = c.accuracy; S.lastFix = fix;
+      maybeLookup(fix);
+    }, err => {
+      log('GPS: ' + (err.code === 1 ? 'permission denied. Allow location for this page.' : 'no signal yet.'));
+    }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
+  }
+
+  /* ---------- speed limit from map ---------- */
+  async function maybeLookup(fix) {
+    if (S.lookupBusy) return;
+    if (S.lastLookup && haversine(S.lastLookup, fix) < 120 && fix.t - S.lastLookup.t < 30000) return;
+    S.lookupBusy = true; S.lastLookup = fix;
+    try {
+      const q = '[out:json][timeout:8];way(around:30,' + fix.lat.toFixed(6) + ',' + fix.lon.toFixed(6) +
+        ')[highway][maxspeed];out tags 10;';
+      const r = await fetch('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q));
+      if (r.ok) S.mapLimit = pickLimit((await r.json()).elements);
+    } catch (e) { /* offline or blocked: keep last value */ }
+    S.lookupBusy = false;
+  }
+
+  /* ---------- camera + detection ---------- */
+  function loadScript(src) {
+    return new Promise((res, rej) => {
+      const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('load ' + src));
+      document.head.appendChild(s);
+    });
+  }
+  async function loadModel() {
+    if (S.model) return;
+    log('Loading traffic light detector (first time takes a while)...');
+    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
+    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js');
+    S.model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    log('Detector ready.');
+  }
+  async function startCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('no camera access');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    video.srcObject = stream; await video.play();
+    S.camera = true; $('stageMsg').classList.add('hide');
+    $('stage').style.aspectRatio = video.videoWidth + ' / ' + video.videoHeight;
+  }
+  function stopCamera() {
+    const st = video.srcObject; if (st) st.getTracks().forEach(t => t.stop());
+    video.srcObject = null; S.camera = false; octx.clearRect(0, 0, overlay.width, overlay.height);
+  }
+
+  async function detectLoop() {
+    if (!S.running) return;
+    try {
+      if (S.model && S.camera && video.readyState >= 2 && video.videoWidth) {
+        const vw = video.videoWidth, vh = video.videoHeight;
+        const ch = Math.round(vh * 0.7);              // lights are in the upper part of the view
+        if (work.width !== vw || work.height !== ch) { work.width = vw; work.height = ch; }
+        wctx.drawImage(video, 0, 0, vw, ch, 0, 0, vw, ch);
+        const preds = await S.model.detect(work, 20, 0.25);
+        const boxes = []; let best = null;
+        for (const p of preds) {
+          if (p.class !== 'traffic light') continue;
+          let x = Math.max(0, Math.floor(p.bbox[0])), y = Math.max(0, Math.floor(p.bbox[1]));
+          let w = Math.min(vw - x, Math.ceil(p.bbox[2])), h = Math.min(ch - y, Math.ceil(p.bbox[3]));
+          if (w < 2 || h < 2) continue;
+          const colour = classifyColour(wctx.getImageData(x, y, w, h).data);
+          const far = Math.max(w, h) / vh < S.minBox;
+          boxes.push({ x, y, w, h, colour, far });
+          if (!far && colour !== 'none' && (!best || w * h > best.area)) best = { colour, area: w * h };
+        }
+        S.hist.push(best ? best.colour : 'none'); if (S.hist.length > 4) S.hist.shift();
+        S.camLight = smoothLight(S.hist);
+        if (overlay.width !== vw || overlay.height !== vh) { overlay.width = vw; overlay.height = vh; }
+        octx.clearRect(0, 0, vw, vh); octx.lineWidth = Math.max(2, vw / 320);
+        for (const b of boxes) {
+          octx.strokeStyle = b.far ? '#8b96a5' : b.colour === 'red' ? '#ff4d4d' : b.colour === 'yellow' ? '#ffb020'
+            : b.colour === 'green' ? '#2fd67a' : '#ffffff';
+          octx.strokeRect(b.x, b.y, b.w, b.h);
+        }
+      }
+    } catch (e) { log('Detector error: ' + e.message); }
+    setTimeout(detectLoop, 150);
+  }
+
+  /* ---------- start / stop ---------- */
+  let wake = null, renderTimer = null;
+  function setTest(on) {
+    S.test = on; $('testBtn').textContent = on ? 'On' : 'Off'; $('testBtn').classList.toggle('on', on);
+    $('testPanel').classList.toggle('hide', !on);
+  }
+  async function start() {
+    S.running = true; $('startBtn').textContent = 'Stop'; $('startBtn').classList.add('stop');
+    try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); await actx.resume(); beep(700, 0.1, 'sine'); }
+    catch (e) { log('Sound is blocked on this device.'); }
+    try { if (navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); } catch (e) {}
+    renderTimer = setInterval(render, 250);
+    startGps();
+    try {
+      await startCamera();
+      await loadModel();
+      detectLoop();
+    } catch (e) {
+      $('stageMsg').classList.remove('hide');
+      $('stageMsg').textContent = S.camera
+        ? 'Camera works, but the detector could not load. Check the internet connection and press Start again.'
+        : 'Camera is not available here. Test mode is on so you can try the alarms.';
+      if (!S.camera) setTest(true);
+      log(String(e.message || e));
+    }
+  }
+  function stop() {
+    S.running = false; $('startBtn').textContent = 'Start'; $('startBtn').classList.remove('stop');
+    clearInterval(renderTimer); if (watchId != null) navigator.geolocation.clearWatch(watchId); watchId = null;
+    stopCamera(); S.hist = []; S.camLight = 'none'; S.gpsSpeed = null;
+    if (wake) { try { wake.release(); } catch (e) {} wake = null; }
+    $('stageMsg').classList.remove('hide'); $('stageMsg').textContent = 'Stopped. Press Start to run again.';
+    render();
+  }
+  document.addEventListener('visibilitychange', async () => {
+    if (S.running && document.visibilityState === 'visible' && navigator.wakeLock) {
+      try { wake = await navigator.wakeLock.request('screen'); } catch (e) {}
+    }
+  });
+
+  /* ---------- controls ---------- */
+  $('startBtn').addEventListener('click', () => S.running ? stop() : start());
+  $('limitRow').addEventListener('click', e => {
+    const v = e.target.dataset.limit; if (!v) return;
+    S.manualLimit = v === 'auto' ? null : Number(v);
+    for (const b of $('limitRow').children) b.classList.toggle('on', b === e.target);
+    render();
+  });
+  $('marginSel').addEventListener('change', e => { S.margin = Number(e.target.value); });
+  $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
+  $('testBtn').addEventListener('click', () => { setTest(!S.test); render(); });
+  $('testSpeed').addEventListener('input', e => {
+    S.testSpeed = Number(e.target.value); $('testSpeedLab').textContent = S.testSpeed + ' km/h'; render();
+  });
+  $('testLightRow').addEventListener('click', e => {
+    const v = e.target.dataset.light; if (!v) return;
+    S.testLight = v; for (const b of $('testLightRow').children) b.classList.toggle('on', b === e.target);
+    render();
+  });
+  render();
+})();
+</script>
+</body>
+</html>
