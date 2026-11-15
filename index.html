@@ -111,6 +111,9 @@
         <option value="0.05">Near (warns late)</option>
       </select>
     </label>
+    <label class="line">Alarm on yellow light
+      <button id="yellowBtn" class="on">On</button>
+    </label>
     <label class="line">Test mode (no driving needed)
       <button id="testBtn">Off</button>
     </label>
@@ -135,7 +138,7 @@ const STOP_KMH = 3; // below this the car counts as stopped (GPS jitters when st
 // Alarm rules. Returns 'red', 'speed' or null.
 function decide(s) {
   if (s.speed == null || s.speed < STOP_KMH) return null;           // stopped or unknown: no alarm
-  if (s.light === 'red' || s.light === 'yellow') return 'red';        // moving at a red/yellow light
+  if (s.light === 'red' || (s.light === 'yellow' && s.yellowAlarm !== false)) return 'red'; // moving at a red/yellow light
   if (s.limit != null && s.speed > s.limit + s.margin) return 'speed'; // over the limit
   return null;
 }
@@ -144,7 +147,7 @@ function decide(s) {
 // A real light is a small bright lamp inside a dark housing, red at the top and green at the bottom.
 // Sign boards fail: they have a large coloured area, a light background, or colour in the wrong place.
 function analyseBox(data, w, h) {
-  const n = w * h, cnt = { red: 0, yellow: 0, green: 0 }, sy = { red: 0, yellow: 0, green: 0 };
+  const n = w * h, cnt = { red: 0, yellow: 0, green: 0 }, sy = { red: 0, yellow: 0, green: 0 }, sx = { red: 0, yellow: 0, green: 0 };
   let dark = 0;
   for (let p = 0; p < n; p++) {
     const i = p * 4, r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
@@ -155,18 +158,25 @@ function analyseBox(data, w, h) {
     if (max === r) hue = ((g - b) / d) % 6; else if (max === g) hue = (b - r) / d + 2; else hue = (r - g) / d + 4;
     hue *= 60; if (hue < 0) hue += 360;
     const c = (hue < 18 || hue > 335) ? 'red' : hue < 70 ? 'yellow' : (hue >= 80 && hue <= 200) ? 'green' : null;
-    if (c) { cnt[c]++; sy[c] += Math.floor(p / w); }
+    if (c) { cnt[c]++; sy[c] += Math.floor(p / w); sx[c] += p % w; }
   }
   const colour = cnt.red >= cnt.yellow && cnt.red >= cnt.green ? 'red' : cnt.yellow >= cnt.green ? 'yellow' : 'green';
   const lit = cnt[colour];
   if (lit < 4 || lit < n * 0.015) return 'none';   // nothing lit
   if (lit > n * 0.5) return 'none';                // big coloured surface: a sign, not a lamp
   if (dark < n * 0.2) return 'none';               // no dark housing around it
-  if (h >= w * 1.3) {                              // upright housing: check the lamp position
-    const pos = (sy[colour] / lit + 0.5) / h;      // 0 = top, 1 = bottom
-    if (colour === 'red' && pos > 0.5) return 'none';
-    if (colour === 'green' && pos < 0.5) return 'none';
-    if (colour === 'yellow' && (pos < 0.22 || pos > 0.78)) return 'none';
+  const posY = (sy[colour] / lit + 0.5) / h;        // 0 = top, 1 = bottom
+  const posX = (sx[colour] / lit + 0.5) / w;        // 0 = left, 1 = right
+  if (colour === 'yellow') {
+    // Orange street lamps (sodium vapour) look like amber. Accept amber only as the middle lamp
+    // of a clearly long housing; a lone glowing lamp is not a traffic light.
+    if (lit > n * 0.35) return 'none';
+    if (h >= w * 1.6) { if (posY < 0.33 || posY > 0.67) return 'none'; }
+    else if (w >= h * 1.6) { if (posX < 0.33 || posX > 0.67) return 'none'; }
+    else return 'none';
+  } else if (h >= w * 1.3) {                        // upright housing: red on top, green at the bottom
+    if (colour === 'red' && posY > 0.5) return 'none';
+    if (colour === 'green' && posY < 0.5) return 'none';
   }
   return colour;
 }
@@ -245,7 +255,7 @@ if (typeof document !== 'undefined') (function () {
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
     hist: [], camLight: 'none',
     manualLimit: null, mapLimit: null, mapRoad: null, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
-    margin: 5, minBox: 0.01,
+    margin: 5, minBox: 0.01, yellowAlarm: true,
     test: false, testSpeed: 0, testLight: 'camera',
   };
 
@@ -298,7 +308,7 @@ if (typeof document !== 'undefined') (function () {
 
     const b = $('banner');
     if (!S.running) { b.className = ''; b.textContent = 'Not running'; setAlarm(null); return; }
-    const alarm = decide({ speed, light, limit, margin: S.margin });
+    const alarm = decide({ speed, light, limit, margin: S.margin, yellowAlarm: S.yellowAlarm });
     if (alarm === 'red') { b.className = 'red'; b.textContent = (light === 'red' ? 'RED' : 'YELLOW') + ' LIGHT - STOP'; }
     else if (alarm === 'speed') { b.className = 'speed'; b.textContent = 'SLOW DOWN - LIMIT ' + limit; }
     else { b.className = 'ok'; b.textContent = speed != null && speed < STOP_KMH ? 'Stopped' : 'OK'; }
@@ -522,6 +532,12 @@ if (typeof document !== 'undefined') (function () {
     try { video.srcObject = await openChosenCamera(); await video.play(); S.hist = []; fitStage(); }
     catch (err) { log('Could not switch camera: ' + (err.message || err)); }
   });
+  function setYellow(on) {
+    S.yellowAlarm = on; $('yellowBtn').textContent = on ? 'On' : 'Off'; $('yellowBtn').classList.toggle('on', on);
+    try { localStorage.setItem('ctw-yellow', on ? '1' : '0'); } catch (e) {}
+  }
+  try { if (localStorage.getItem('ctw-yellow') === '0') setYellow(false); } catch (e) {}
+  $('yellowBtn').addEventListener('click', () => { setYellow(!S.yellowAlarm); render(); });
   $('testBtn').addEventListener('click', () => { setTest(!S.test); render(); });
   $('testSpeed').addEventListener('input', e => {
     S.testSpeed = Number(e.target.value); $('testSpeedLab').textContent = S.testSpeed + ' km/h'; render();
