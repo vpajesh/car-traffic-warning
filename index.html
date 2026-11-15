@@ -49,6 +49,15 @@
   #log { margin-top: 10px; font-size: 12px; color: var(--dim); min-height: 18px; }
   .hide { display: none !important; }
   .note { font-size: 12px; color: var(--dim); margin: 6px 0 0; }
+  /* phone turned sideways: camera fills the left, readings on the right */
+  @media (orientation: landscape) and (max-height: 600px) {
+    main { max-width: none; display: grid; grid-template-columns: minmax(0, 1fr) 270px; gap: 0 10px; padding: 8px; align-items: start; }
+    h1 { display: none; }
+    #stage { grid-column: 1; aspect-ratio: auto !important; height: calc(100vh - 16px); height: calc(100dvh - 16px); }
+    #side { grid-column: 2; }
+    #banner { margin-top: 0; }
+    main > section, main > .note { grid-column: 1 / -1; }
+  }
 </style>
 </head>
 <body>
@@ -61,6 +70,7 @@
     <div id="stageMsg">Mount the phone so the rear camera faces the road, then press Start.</div>
   </div>
 
+  <div id="side">
   <div id="banner">Not running</div>
 
   <div class="tiles">
@@ -71,6 +81,7 @@
 
   <button id="startBtn">Start</button>
   <div id="log"></div>
+  </div>
 
   <section>
     <h2>Speed limit</h2>
@@ -310,8 +321,12 @@ if (typeof document !== 'undefined') (function () {
     });
     video.srcObject = stream; await video.play();
     S.camera = true; $('stageMsg').classList.add('hide');
-    $('stage').style.aspectRatio = video.videoWidth + ' / ' + video.videoHeight;
+    fitStage();
   }
+  function fitStage() {
+    if (video.videoWidth) $('stage').style.aspectRatio = video.videoWidth + ' / ' + video.videoHeight;
+  }
+  video.addEventListener('resize', fitStage);   // camera picture changes shape when the phone rotates
   function stopCamera() {
     const st = video.srcObject; if (st) st.getTracks().forEach(t => t.stop());
     video.srcObject = null; S.camera = false; octx.clearRect(0, 0, overlay.width, overlay.height);
