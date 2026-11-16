@@ -87,12 +87,12 @@
   <section>
     <h2>Speed limit</h2>
     <div class="row" id="limitRow">
-      <button data-limit="auto" class="on">Auto (map)</button>
+      <button data-limit="auto" class="on">Auto</button>
       <button data-limit="40">40</button><button data-limit="60">60</button>
       <button data-limit="80">80</button><button data-limit="100">100</button>
       <button data-limit="120">120</button><button data-limit="140">140</button>
     </div>
-    <p class="note">Auto looks up the road's limit by GPS. Tap a number to set it yourself.</p>
+    <p class="note">Auto reads the limit from the roadside boards with the camera, and uses the map by GPS until a board is read. Tap a number to set it yourself.</p>
     <label class="line">TomTom key
       <input id="ttKey" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="paste key here">
     </label>
@@ -197,18 +197,111 @@ function nms(boxes, thr) {
   return keep;
 }
 
-// Detector output -> traffic light boxes in frame coordinates.
-// out is laid out [84 rows][anchors]; reg is the searched region {x, y, w, h} of the frame.
-function decodeLights(out, anchors, reg, lb, minScore) {
-  const boxes = [], row = (TL_CLASS + 4) * anchors;
+// Detector output -> boxes in frame coordinates, for the wanted classes only.
+// out is laid out [4 + classes rows][anchors]; reg is the searched region {x, y, w, h} of the frame.
+function decodeClasses(out, anchors, classes, reg, lb, minScore) {
+  const boxes = [];
   for (let i = 0; i < anchors; i++) {
-    const sc = out[row + i];
+    let sc = 0, cls = -1;
+    for (const c of classes) { const v = out[(c + 4) * anchors + i]; if (v > sc) { sc = v; cls = c; } }
     if (sc < minScore) continue;
     const w = out[2 * anchors + i], h = out[3 * anchors + i];
     boxes.push({ x: (out[i] - w / 2 - lb.padX) / lb.scale + reg.x, y: (out[anchors + i] - h / 2 - lb.padY) / lb.scale + reg.y,
-      w: w / lb.scale, h: h / lb.scale, score: sc });
+      w: w / lb.scale, h: h / lb.scale, score: sc, cls });
   }
   return nms(boxes, 0.5);
+}
+
+/* --- speed limit boards --- */
+// UAE boards come in two styles: one number in the middle, or the Arabic number on top with the
+// English number below. The board detector gives a box around the board (sometimes with another sign
+// below it, and the board often looks like an upright oval when seen from the side).
+
+// Finds the white face of the board inside the detector's box. Starting from the middle of the
+// board it spreads over bright, colourless pixels; the red ring stops it, so the sky behind the board
+// and a yellow sign below are left out. Returns {x0, y0, x1, y1} in frame pixels, or null.
+function boardFace(rgba, fw, fh, box) {
+  const bx = Math.max(0, Math.round(box.x)), by = Math.max(0, Math.round(box.y));
+  const bw = Math.min(fw - bx, Math.round(box.w)), bh = Math.min(fh - by, Math.round(box.h));
+  if (bw < 16 || bh < 16) return null;
+  const lum = new Float32Array(bw * bh);            // brightness, or -1 for coloured pixels (ring, yellow signs)
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    const p = ((by + y) * fw + bx + x) * 4, r = rgba[p], g = rgba[p + 1], b = rgba[p + 2], mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    lum[y * bw + x] = mx > 0 && (mx - mn) / mx > 0.35 ? -1 : r * 0.3 + g * 0.59 + b * 0.11;
+  }
+  // the board is as wide as the box and sits at its top; take the face brightness from its middle
+  const mid = Math.min(bh - 1, Math.round(bw / 2)), half = Math.max(2, Math.round(bw * 0.2)), sample = [];
+  for (let y = Math.max(0, mid - half); y <= Math.min(bh - 1, mid + half); y++)
+    for (let x = Math.round(bw / 2) - half; x <= Math.round(bw / 2) + half; x++) if (lum[y * bw + x] >= 0) sample.push(lum[y * bw + x]);
+  if (sample.length < 8) return null;
+  sample.sort((a, b) => a - b);
+  const faceLum = sample[Math.floor(sample.length * 0.9)], isFace = q => lum[q] >= faceLum * 0.75;
+  let seed = -1, bestD = 1e9;                       // nearest face pixel to the middle of the board
+  for (let y = Math.max(0, mid - half); y <= Math.min(bh - 1, mid + half); y++)
+    for (let x = Math.round(bw / 2) - half; x <= Math.round(bw / 2) + half; x++) {
+      const q = y * bw + x, d = Math.abs(x - bw / 2) + Math.abs(y - mid);
+      if (isFace(q) && d < bestD) { bestD = d; seed = q; }
+    }
+  if (seed < 0) return null;
+  const seen = new Uint8Array(bw * bh), stack = [seed]; seen[seed] = 1;
+  let x0 = bw, y0 = bh, x1 = -1, y1 = -1, count = 0;
+  while (stack.length) {
+    const q = stack.pop(), x = q % bw, y = (q - x) / bw; count++;
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    if (x > 0 && !seen[q - 1] && isFace(q - 1)) { seen[q - 1] = 1; stack.push(q - 1); }
+    if (x < bw - 1 && !seen[q + 1] && isFace(q + 1)) { seen[q + 1] = 1; stack.push(q + 1); }
+    if (y > 0 && !seen[q - bw] && isFace(q - bw)) { seen[q - bw] = 1; stack.push(q - bw); }
+    if (y < bh - 1 && !seen[q + bw] && isFace(q + bw)) { seen[q + bw] = 1; stack.push(q + bw); }
+  }
+  if (x1 - x0 < 10 || y1 - y0 < 10 || count < 60) return null;
+  return { x0: bx + x0, y0: by + y0, x1: bx + x1 + 1, y1: by + y1 + 1 };
+}
+
+// Cuts the number area out of the board face ('full' = whole face, 'lower' = lower half), blanks
+// everything outside the oval face, enlarges it and raises the contrast for the number reader.
+// Returns a grey picture {data, w, h}, or null when the board is too small to read.
+function signCrop(rgba, fw, fh, box, part) {
+  const f = boardFace(rgba, fw, fh, box); if (!f) return null;
+  const fwd = f.x1 - f.x0, fht = f.y1 - f.y0, cx = (f.x0 + f.x1) / 2, cy = (f.y0 + f.y1) / 2;
+  const sx = Math.round(f.x0 + fwd * 0.04), ex = Math.round(f.x1 - fwd * 0.04);
+  const sy = Math.round(part === 'lower' ? f.y0 + fht * 0.47 : f.y0 + fht * 0.08), ey = Math.round(part === 'lower' ? f.y1 - fht * 0.04 : f.y1 - fht * 0.08);
+  const cw = ex - sx, ch = ey - sy; if (cw < 12 || ch < 7) return null;
+  const grey = new Float32Array(cw * ch), inside = [];
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const p = ((sy + y) * fw + sx + x) * 4, dx = (sx + x + 0.5 - cx) / (fwd * 0.49), dy = (sy + y + 0.5 - cy) / (fht * 0.49);
+    if (dx * dx + dy * dy <= 1) { const v = rgba[p] * 0.3 + rgba[p + 1] * 0.59 + rgba[p + 2] * 0.11; grey[y * cw + x] = v; inside.push(v); }
+    else grey[y * cw + x] = -1;                                       // the ring and whatever is behind the board
+  }
+  if (inside.length < 40) return null;
+  inside.sort((a, b) => a - b);
+  const lo = inside[Math.floor(inside.length * 0.03)], hi = inside[Math.floor(inside.length * 0.9)], span = Math.max(1, hi - lo);
+  for (let q = 0; q < grey.length; q++) grey[q] = grey[q] < 0 ? 255 : Math.max(0, Math.min(255, (grey[q] - lo) / span * 255));
+  const k = Math.max(2, Math.ceil(64 / ch)), pad = 24, ow = cw * k + pad * 2, oh = ch * k + pad * 2;
+  const data = new Uint8ClampedArray(ow * oh).fill(255);
+  for (let y = 0; y < ch * k; y++) for (let x = 0; x < cw * k; x++) {     // smooth enlargement
+    const fx = Math.min(cw - 1.001, Math.max(0, (x + 0.5) / k - 0.5)), fy = Math.min(ch - 1.001, Math.max(0, (y + 0.5) / k - 0.5));
+    const ix = Math.floor(fx), iy = Math.floor(fy), ax = fx - ix, ay = fy - iy;
+    data[(y + pad) * ow + x + pad] = grey[iy * cw + ix] * (1 - ax) * (1 - ay) + grey[iy * cw + ix + 1] * ax * (1 - ay) +
+      grey[(iy + 1) * cw + ix] * (1 - ax) * ay + grey[(iy + 1) * cw + ix + 1] * ax * ay;
+  }
+  return { data, w: ow, h: oh };
+}
+
+// Text from the number reader -> a real speed limit, or null.
+// Only round numbers from 20 to 160 count, so "5.5T", "4.9 m" or "12m" boards are not taken as limits.
+function parseLimit(text) {
+  const d = String(text || '').replace(/[^0-9]/g, '');
+  if (d.length < 2 || d.length > 3) return null;
+  const n = Number(d);
+  return n >= 20 && n <= 160 && n % 10 === 0 ? n : null;
+}
+
+// A board's number is accepted when two looks at it within 3 seconds read the same number.
+// reads: [{t, value}] oldest first. Returns the number or null.
+function confirmLimit(reads, now) {
+  const recent = reads.filter(r => now - r.t <= 3000);
+  for (let i = recent.length - 1; i > 0; i--) for (let k = i - 1; k >= 0; k--) if (recent[i].value === recent[k].value) return recent[i].value;
+  return null;
 }
 
 // Colour of the lit lamp inside a box the detector called a traffic light.
@@ -350,11 +443,13 @@ if (typeof document !== 'undefined') (function () {
   const frameC = document.createElement('canvas'), fctx = frameC.getContext('2d', { willReadFrequently: true });   // full camera frame
   const netC = document.createElement('canvas'), nctx = netC.getContext('2d', { willReadFrequently: true });       // detector input
   netC.width = netC.height = NET;
+  const ocrC = document.createElement('canvas'), ocrCtx = ocrC.getContext('2d');                                    // picture for the number reader
 
   const S = {
     running: false, camera: false, model: null,
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
     hist: [], camLight: 'none', boxes: [], passMs: 0, greenAt: 0,
+    signModel: null, signClasses: [], ocr: null, signReady: false, signReads: [], signLimit: null, signBoxes: [],
     gate: 'near', mapSignals: [], marks: [], sigAt: null, sigTry: 0, sigBusy: false, sigState: 'not loaded yet',
     manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
     margin: 5, minBox: 0.01, yellowAlarm: true,
@@ -392,7 +487,9 @@ if (typeof document !== 'undefined') (function () {
     if (S.test && S.testLight !== 'camera') return S.testLight;
     return S.camLight;
   }
-  function currentLimit() { return S.manualLimit != null ? S.manualLimit : S.mapLimit; }
+  const BOARD_KEEP_MS = 10 * 60 * 1000;   // a board's limit is kept this long unless another board is read
+  const boardLimit = () => S.signLimit && Date.now() - S.signLimit.t < BOARD_KEEP_MS ? S.signLimit.value : null;
+  function currentLimit() { return S.manualLimit != null ? S.manualLimit : boardLimit() != null ? boardLimit() : S.mapLimit; }
 
   /* ---------- screen ---------- */
   function render() {
@@ -401,7 +498,7 @@ if (typeof document !== 'undefined') (function () {
     $('speedSub').textContent = S.test ? 'km/h (test)' : speed == null ? (S.lastFix ? 'GPS ok, no speed yet' : 'waiting for GPS') :
       'km/h' + (S.gpsAcc != null ? ' ±' + Math.round(S.gpsAcc) + ' m' : '');
     $('limitVal').textContent = limit == null ? '--' : limit;
-    $('limitSub').textContent = S.manualLimit != null ? 'set by you' : S.mapLimit != null ? S.mapSrc + ': ' + S.mapRoad
+    $('limitSub').textContent = S.manualLimit != null ? 'set by you' : boardLimit() != null ? 'read from board' : S.mapLimit != null ? S.mapSrc + ': ' + S.mapRoad
       : S.mapRoad ? 'no limit on map: ' + S.mapRoad : S.ttError ? 'TomTom key not accepted' : 'road not found';
     const lv = $('lightVal');
     lv.textContent = light === 'none' ? '--' : light[0].toUpperCase() + light.slice(1);
@@ -550,6 +647,31 @@ if (typeof document !== 'undefined') (function () {
     S.model = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
     log('Detector ready.');
   }
+  // Board reader: the detector trained for speed limit boards plus a number reader. Loaded after the
+  // traffic light detector; if it cannot load, the rest of the app still works.
+  async function loadSigns() {
+    if (S.signReady) return;
+    try {
+      const labels = await (await fetch('models/ctw_labels.json')).json();
+      S.signClasses = labels.map((n, i) => /^speed limit/i.test(n) ? i : -1).filter(i => i >= 0);
+      const buf = await download('models/ctw_signs.onnx', 'Loading board reader');
+      S.signModel = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
+      log('Loading number reader...');
+      await loadScript('vendor/tesseract/tesseract.min.js');
+      const base = new URL('vendor/tesseract/', location.href).href;
+      S.ocr = await Tesseract.createWorker('eng', 1, { workerPath: base + 'worker.min.js', corePath: base, langPath: base + 'lang', gzip: true });
+      await S.ocr.setParameters({ tessedit_char_whitelist: '0123456789', tessedit_pageseg_mode: '7' });
+      S.signReady = true; log('Board reader ready.');
+    } catch (e) { log('Board reader could not load: ' + (e.message || e)); }
+  }
+  async function readNumber(c) {          // c: grey picture from signCrop
+    ocrC.width = c.w; ocrC.height = c.h;
+    const img = ocrCtx.createImageData(c.w, c.h);
+    for (let q = 0, p = 0; q < c.data.length; q++, p += 4) { img.data[p] = img.data[p + 1] = img.data[p + 2] = c.data[q]; img.data[p + 3] = 255; }
+    ocrCtx.putImageData(img, 0, 0);
+    return (await S.ocr.recognize(ocrC)).data.text;
+  }
+
   /* The phone has several back cameras (normal, ultra wide, telephoto). The choice is remembered. */
   const CAM_KEY = 'ctw-camera';
   const savedCam = () => { try { return localStorage.getItem(CAM_KEY) || ''; } catch (e) { return ''; } };
@@ -596,54 +718,108 @@ if (typeof document !== 'undefined') (function () {
     video.srcObject = null; S.camera = false; octx.clearRect(0, 0, overlay.width, overlay.height);
   }
 
-  // Parts of the picture to search, as fractions [x, y, width, height]. The whole view finds nearby
-  // signals; the three zoomed parts find distant ones. One part is searched per look, centre most often.
-  const LOOKS = [[0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0, 0.1, 0.4, 0.6], [0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0.6, 0.1, 0.4, 0.6]];
-  let look = 0;
+  // Runs a detector on one part of the frozen frame. g = [x, y, width, height] as fractions.
+  async function runNet(session, g, vw, vh) {
+    const reg = { x: Math.round(g[0] * vw), y: Math.round(g[1] * vh), w: Math.round(g[2] * vw), h: Math.round(g[3] * vh) }, lb = letterbox(reg.w, reg.h);
+    nctx.fillStyle = 'rgb(114,114,114)'; nctx.fillRect(0, 0, NET, NET);
+    nctx.drawImage(frameC, reg.x, reg.y, reg.w, reg.h, lb.padX, lb.padY, lb.dw, lb.dh);
+    const t0 = performance.now();
+    const res = await session.run({ [session.inputNames[0]]: new ort.Tensor('float32', toTensor(nctx.getImageData(0, 0, NET, NET).data), [1, 3, NET, NET]) });
+    S.passMs = S.passMs ? S.passMs * 0.8 + (performance.now() - t0) * 0.2 : performance.now() - t0;
+    return { o: res[session.outputNames[0]], reg, lb };
+  }
+  const clampBox = (b, vw, vh) => {
+    const x = Math.max(0, Math.floor(b.x)), y = Math.max(0, Math.floor(b.y));
+    return { x, y, w: Math.min(vw - x, Math.ceil(b.w)), h: Math.min(vh - y, Math.ceil(b.h)) };
+  };
+
+  // Traffic lights. The whole view finds nearby signals; the three zoomed parts find distant ones.
+  // One part is searched per look, the centre most often.
+  const LIGHT_LOOKS = [[0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0, 0.1, 0.4, 0.6], [0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0.6, 0.1, 0.4, 0.6]];
+  let lightStep = 0;
+  async function lightLook(vw, vh) {
+    const { o, reg, lb } = await runNet(S.model, LIGHT_LOOKS[lightStep++ % LIGHT_LOOKS.length], vw, vh), now = Date.now(), found = [];
+    for (const d of decodeClasses(o.data, o.dims[2], [TL_CLASS], reg, lb, 0.2)) {
+      const b = clampBox(d, vw, vh); if (b.w < 3 || b.h < 3) continue;
+      b.score = d.score; b.t = now; b.colour = lampColour(fctx.getImageData(b.x, b.y, b.w, b.h).data, b.w, b.h);
+      found.push(b);
+    }
+    // keep recent boxes from the parts not searched this time
+    const inReg = b => { const cx = b.x + b.w / 2, cy = b.y + b.h / 2; return cx >= reg.x && cx <= reg.x + reg.w && cy >= reg.y && cy <= reg.y + reg.h; };
+    S.boxes = nms(found.concat(S.boxes.filter(b => now - b.t < 1500 && !inReg(b))), 0.4);
+    const seen = pickLight(S.boxes, vh, S.minBox);
+    if (seen === 'green') S.greenAt = now;
+    const colour = afterGreen(seen, now - S.greenAt);
+    if (colour !== 'none') S.hist.push({ t: now, colour });
+  }
+
+  // Speed limit boards: left half, right half, whole view in turn. Each board found is read; a number
+  // counts once two looks within 3 seconds agree.
+  const SIGN_LOOKS = [[0, 0.1, 0.5, 0.7], [0.5, 0.1, 0.5, 0.7], [0, 0, 1, 1]];
+  let signStep = 0, signFollow = 0;      // signFollow: keep looking at the same part until this time, after a board was found there
+  async function signLook(vw, vh) {
+    const { o, reg, lb } = await runNet(S.signModel, SIGN_LOOKS[signStep % SIGN_LOOKS.length], vw, vh), now = Date.now();
+    const found = decodeClasses(o.data, o.dims[2], S.signClasses, reg, lb, 0.3).sort((a, b) => b.w * b.h - a.w * a.h).slice(0, 2);
+    S.signBoxes = S.signBoxes.filter(b => now - b.t < 1500);
+    if (found.length) signFollow = now + 2000; else if (now >= signFollow) signStep++;
+    for (const d of found) {
+      const b = clampBox(d, vw, vh); if (b.w < 16 || b.h < 16) continue;
+      const px = fctx.getImageData(b.x, b.y, b.w, b.h).data; b.t = now; b.value = null;
+      for (const part of ['full', 'lower']) {
+        const c = signCrop(px, b.w, b.h, { x: 0, y: 0, w: b.w, h: b.h }, part); if (!c) break;
+        b.value = parseLimit(await readNumber(c)); if (b.value != null) break;
+      }
+      if (b.value != null) S.signReads.push({ t: now, value: b.value });
+      log(b.value != null ? 'Board seen: ' + b.value : 'Board seen, number not read.');
+      S.signBoxes.push(b);
+    }
+    S.signReads = S.signReads.filter(r => now - r.t <= 3000);
+    const v = confirmLimit(S.signReads, now);
+    if (v != null) S.signLimit = { value: v, t: now };
+  }
+
+  function drawOverlay(vw, vh, open) {
+    if (overlay.width !== vw || overlay.height !== vh) { overlay.width = vw; overlay.height = vh; }
+    const lw = Math.max(2, vw / 320), now = Date.now();
+    octx.clearRect(0, 0, vw, vh);
+    for (const b of S.boxes) {
+      const ignored = !open || b.colour === 'none' || b.y + b.h / 2 > vh * 0.62 || Math.max(b.w, b.h) / vh < S.minBox;
+      octx.lineWidth = ignored ? lw / 2 : lw;
+      octx.strokeStyle = ignored ? '#8b96a5' : b.colour === 'red' ? '#ff4d4d' : b.colour === 'yellow' ? '#ffb020' : '#2fd67a';
+      octx.strokeRect(b.x, b.y, b.w, b.h);
+    }
+    octx.font = 'bold ' + Math.round(vw / 40) + 'px system-ui, sans-serif'; octx.fillStyle = '#4da3ff'; octx.strokeStyle = '#4da3ff'; octx.lineWidth = lw;
+    for (const b of S.signBoxes) {
+      if (now - b.t > 1500) continue;
+      octx.strokeRect(b.x, b.y, b.w, b.h);
+      if (b.value != null) octx.fillText(String(b.value), b.x, Math.max(vw / 40, b.y - lw * 2));
+    }
+  }
+
+  // One look per turn. Near a signal: mostly traffic lights, every third look a board look (every
+  // second look for 2 seconds after a board was found, so it is read again quickly).
+  // Away from signals the red light check is paused, so every look is a board look.
+  let turn = 0;
   async function detectLoop() {
     if (!S.running) return;
+    let idle = false;
     try {
       if (S.model && S.camera && video.readyState >= 2 && video.videoWidth) {
-        const vw = video.videoWidth, vh = video.videoHeight, g = LOOKS[look++ % LOOKS.length];
-        const reg = { x: Math.round(g[0] * vw), y: Math.round(g[1] * vh), w: Math.round(g[2] * vw), h: Math.round(g[3] * vh) };
+        const vw = video.videoWidth, vh = video.videoHeight, open = gateInfo().open, now = Date.now();
         if (frameC.width !== vw || frameC.height !== vh) { frameC.width = vw; frameC.height = vh; }
-        fctx.drawImage(video, 0, 0, vw, vh);                       // freeze one frame for both steps below
-        const lb = letterbox(reg.w, reg.h);
-        nctx.fillStyle = 'rgb(114,114,114)'; nctx.fillRect(0, 0, NET, NET);
-        nctx.drawImage(frameC, reg.x, reg.y, reg.w, reg.h, lb.padX, lb.padY, lb.dw, lb.dh);
-        const t0 = performance.now();
-        const res = await S.model.run({ [S.model.inputNames[0]]: new ort.Tensor('float32', toTensor(nctx.getImageData(0, 0, NET, NET).data), [1, 3, NET, NET]) });
-        const o = res[S.model.outputNames[0]];
-        S.passMs = S.passMs ? S.passMs * 0.8 + (performance.now() - t0) * 0.2 : performance.now() - t0;
-        const now = Date.now(), found = [];
-        for (const b of decodeLights(o.data, o.dims[2], reg, lb, 0.2)) {
-          const x = Math.max(0, Math.floor(b.x)), y = Math.max(0, Math.floor(b.y));
-          const w = Math.min(vw - x, Math.ceil(b.w)), h = Math.min(vh - y, Math.ceil(b.h));
-          if (w < 3 || h < 3) continue;
-          found.push({ x, y, w, h, score: b.score, t: now, colour: lampColour(fctx.getImageData(x, y, w, h).data, w, h) });
-        }
-        // keep recent boxes from the parts not searched this time
-        const inReg = b => { const cx = b.x + b.w / 2, cy = b.y + b.h / 2; return cx >= reg.x && cx <= reg.x + reg.w && cy >= reg.y && cy <= reg.y + reg.h; };
-        S.boxes = nms(found.concat(S.boxes.filter(b => now - b.t < 1500 && !inReg(b))), 0.4);
-        const open = gateInfo().open, seen = open ? pickLight(S.boxes, vh, S.minBox) : 'none';
-        if (seen === 'green') S.greenAt = now;
-        const colour = afterGreen(seen, now - S.greenAt);
-        if (colour !== 'none') S.hist.push({ t: now, colour });
-        while (S.hist.length && now - S.hist[0].t > SIGHT_MS) S.hist.shift();
-        S.camLight = smoothLight(S.hist, now);
-        if (overlay.width !== vw || overlay.height !== vh) { overlay.width = vw; overlay.height = vh; }
-        const lw = Math.max(2, vw / 320);
-        octx.clearRect(0, 0, vw, vh);
-        for (const b of S.boxes) {
-          const ignored = !open || b.colour === 'none' || b.y + b.h / 2 > vh * 0.62 || Math.max(b.w, b.h) / vh < S.minBox;
-          octx.lineWidth = ignored ? lw / 2 : lw;
-          octx.strokeStyle = ignored ? '#8b96a5' : b.colour === 'red' ? '#ff4d4d' : b.colour === 'yellow' ? '#ffb020' : '#2fd67a';
-          octx.strokeRect(b.x, b.y, b.w, b.h);
-        }
-        if (look % 6 === 0) log('Detector: ' + Math.round(S.passMs) + ' ms per look.');
-      }
-    } catch (e) { log('Detector error: ' + (e.message || e)); }
-    setTimeout(detectLoop, 30);
+        fctx.drawImage(video, 0, 0, vw, vh);                       // freeze one frame for this look
+        turn++;
+        if (S.signReady && (!open || turn % 3 === 0 || (now < signFollow && turn % 2 === 0))) await signLook(vw, vh);
+        else if (open) await lightLook(vw, vh);
+        else idle = true;
+        if (!open) S.boxes = S.boxes.filter(b => now - b.t < 1500);
+        while (S.hist.length && Date.now() - S.hist[0].t > SIGHT_MS) S.hist.shift();
+        S.camLight = open ? smoothLight(S.hist, Date.now()) : 'none';
+        drawOverlay(vw, vh, open);
+        if (turn % 8 === 0 && S.passMs) log('Detector: ' + Math.round(S.passMs) + ' ms per look.' + (S.signReady ? ' Board reader on.' : ''));
+      } else idle = true;
+    } catch (e) { log('Detector error: ' + (e.message || e)); idle = true; }
+    setTimeout(detectLoop, idle ? 250 : 30);
   }
 
   /* ---------- start / stop ---------- */
@@ -663,6 +839,7 @@ if (typeof document !== 'undefined') (function () {
       await startCamera();
       await loadModel();
       detectLoop();
+      loadSigns();
     } catch (e) {
       $('stageMsg').classList.remove('hide');
       $('stageMsg').textContent = S.camera
@@ -675,7 +852,7 @@ if (typeof document !== 'undefined') (function () {
   function stop() {
     S.running = false; $('startBtn').textContent = 'Start'; $('startBtn').classList.remove('stop');
     clearInterval(renderTimer); if (watchId != null) navigator.geolocation.clearWatch(watchId); watchId = null;
-    stopCamera(); S.hist = []; S.boxes = []; S.greenAt = 0; S.camLight = 'none'; S.gpsSpeed = null;
+    stopCamera(); S.hist = []; S.boxes = []; S.signBoxes = []; S.signReads = []; S.greenAt = 0; S.camLight = 'none'; S.gpsSpeed = null;
     if (wake) { try { wake.release(); } catch (e) {} wake = null; }
     $('stageMsg').classList.remove('hide'); $('stageMsg').textContent = 'Stopped. Press Start to run again.';
     render();
