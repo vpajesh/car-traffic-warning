@@ -355,7 +355,7 @@ if (typeof document !== 'undefined') (function () {
     running: false, camera: false, model: null,
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
     hist: [], camLight: 'none', boxes: [], passMs: 0, greenAt: 0,
-    gate: 'near', mapSignals: [], marks: [], sigAt: null, sigTry: 0, sigBusy: false,
+    gate: 'near', mapSignals: [], marks: [], sigAt: null, sigTry: 0, sigBusy: false, sigState: 'not loaded yet',
     manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
     margin: 5, minBox: 0.01, yellowAlarm: true,
     test: false, testSpeed: 0, testLight: 'camera',
@@ -398,7 +398,7 @@ if (typeof document !== 'undefined') (function () {
   function render() {
     const speed = currentSpeed(), light = currentLight(), limit = currentLimit();
     $('speedVal').textContent = speed == null ? '--' : Math.round(speed);
-    $('speedSub').textContent = S.test ? 'km/h (test)' : speed == null ? 'waiting for GPS' :
+    $('speedSub').textContent = S.test ? 'km/h (test)' : speed == null ? (S.lastFix ? 'GPS ok, no speed yet' : 'waiting for GPS') :
       'km/h' + (S.gpsAcc != null ? ' ±' + Math.round(S.gpsAcc) + ' m' : '');
     $('limitVal').textContent = limit == null ? '--' : limit;
     $('limitSub').textContent = S.manualLimit != null ? 'set by you' : S.mapLimit != null ? S.mapSrc + ': ' + S.mapRoad
@@ -409,7 +409,7 @@ if (typeof document !== 'undefined') (function () {
     const gi = gateInfo();
     $('lightSub').textContent = (S.test && S.testLight !== 'camera') ? 'test' : !S.camera ? 'no camera' : gi.open ? 'camera' : 'paused';
     $('sigInfo').textContent = !S.lastFix ? 'Waiting for GPS. Known signals: ' + gi.count + '.'
-      : 'Known signals nearby: ' + gi.count + ' (' + S.marks.length + ' marked by you). Nearest: ' +
+      : 'Map signals: ' + S.sigState + '. Known signals nearby: ' + gi.count + ' (' + S.marks.length + ' marked by you). Nearest: ' +
         (gi.nearest == null ? 'none' : Math.round(gi.nearest) + ' m') + '. ' +
         (S.gate === 'all' ? 'Checking everywhere.' : gi.near ? 'Signal ahead: checking for red.' : 'No signal ahead: red light check paused.');
 
@@ -488,15 +488,15 @@ if (typeof document !== 'undefined') (function () {
   async function maybeSignals(fix) {
     if (S.sigBusy || Date.now() - S.sigTry < 20000) return;
     if (S.sigAt && haversine(S.sigAt, fix) < 1500) return;
-    S.sigBusy = true; S.sigTry = Date.now();
+    S.sigBusy = true; S.sigTry = Date.now(); if (!S.sigAt) S.sigState = 'loading...';
     try {
       const q = '[out:json][timeout:15];node(around:3500,' + fix.lat.toFixed(5) + ',' + fix.lon.toFixed(5) + ')[highway=traffic_signals];out;';
       const r = await fetch('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q));
       if (r.ok) {
         S.mapSignals = ((await r.json()).elements || []).filter(e => e.lat != null).map(e => ({ lat: e.lat, lon: e.lon }));
-        S.sigAt = fix;
-      }
-    } catch (e) { /* offline: try again later */ }
+        S.sigAt = fix; S.sigState = 'loaded';
+      } else if (!S.sigAt) S.sigState = 'map did not answer, will retry';
+    } catch (e) { if (!S.sigAt) S.sigState = 'no internet for the map, will retry'; }
     S.sigBusy = false;
   }
   // open = the camera's red/yellow result may be used now
