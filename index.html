@@ -100,6 +100,22 @@
   </section>
 
   <section>
+    <h2>Traffic signals</h2>
+    <label class="line">Check for red lights
+      <select id="gateSel">
+        <option value="near" selected>Only near known signals</option>
+        <option value="all">Everywhere</option>
+      </select>
+    </label>
+    <div id="sigInfo" class="note">Waiting for GPS.</div>
+    <div class="row" style="margin-top:8px">
+      <button id="markBtn">Mark signal here</button>
+      <button id="unmarkBtn">Remove my nearest mark</button>
+    </div>
+    <p class="note">Signal positions come from OpenStreetMap. If a signal is missing, press "Mark signal here" while stopped at it; the phone remembers it. "Everywhere" checks all the time and gives more false alarms.</p>
+  </section>
+
+  <section>
     <h2>Settings</h2>
     <label class="line">Speed alarm margin
       <select id="marginSel">
@@ -148,42 +164,112 @@ function decide(s) {
   return null;
 }
 
-// Decides whether a detected box really is a lit traffic light, and which colour.
-// A real light is a small bright lamp inside a dark housing, red at the top and green at the bottom.
-// Sign boards fail: they have a large coloured area, a light background, or colour in the wrong place.
-function analyseBox(data, w, h) {
-  const n = w * h, cnt = { red: 0, yellow: 0, green: 0 }, sy = { red: 0, yellow: 0, green: 0 }, sx = { red: 0, yellow: 0, green: 0 };
-  let dark = 0;
+/* --- detector plumbing --- */
+const NET = 640;        // detector input size
+const TL_CLASS = 9;     // "traffic light" in the detector's class list
+
+// 640x640 RGBA picture -> detector input (planar RGB, 0..1).
+function toTensor(rgba) {
+  const n = NET * NET, out = new Float32Array(3 * n);
+  for (let i = 0, p = 0; i < n; i++, p += 4) {
+    out[i] = rgba[p] / 255; out[n + i] = rgba[p + 1] / 255; out[2 * n + i] = rgba[p + 2] / 255;
+  }
+  return out;
+}
+
+// Where a region of the frame lands inside the 640x640 input (kept in proportion, centred).
+function letterbox(rw, rh) {
+  const scale = Math.min(NET / rw, NET / rh), dw = Math.round(rw * scale), dh = Math.round(rh * scale);
+  return { scale, dw, dh, padX: Math.floor((NET - dw) / 2), padY: Math.floor((NET - dh) / 2) };
+}
+
+function iou(a, b) {
+  const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y), x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  return inter / (a.w * a.h + b.w * b.h - inter || 1);
+}
+
+// Keeps the best box of each overlapping group.
+function nms(boxes, thr) {
+  boxes.sort((a, b) => b.score - a.score);
+  const keep = [];
+  for (const b of boxes) if (!keep.some(k => iou(k, b) > thr)) keep.push(b);
+  return keep;
+}
+
+// Detector output -> traffic light boxes in frame coordinates.
+// out is laid out [84 rows][anchors]; reg is the searched region {x, y, w, h} of the frame.
+function decodeLights(out, anchors, reg, lb, minScore) {
+  const boxes = [], row = (TL_CLASS + 4) * anchors;
+  for (let i = 0; i < anchors; i++) {
+    const sc = out[row + i];
+    if (sc < minScore) continue;
+    const w = out[2 * anchors + i], h = out[3 * anchors + i];
+    boxes.push({ x: (out[i] - w / 2 - lb.padX) / lb.scale + reg.x, y: (out[anchors + i] - h / 2 - lb.padY) / lb.scale + reg.y,
+      w: w / lb.scale, h: h / lb.scale, score: sc });
+  }
+  return nms(boxes, 0.5);
+}
+
+// Colour of the lit lamp inside a box the detector called a traffic light.
+// Tuned on night dashcam footage: a real red lamp has a core of strongly saturated red, while shop
+// signs, street lamp glare and reflective road posts are paler. Yellow is accepted only as the
+// middle lamp of a long housing, because lit windows and yellow shop signs look the same otherwise.
+function lampColour(data, w, h) {
+  const n = w * h; let redV = 0, yelV = 0, grn = 0, yx = 0, yy = 0;
   for (let p = 0; p < n; p++) {
     const i = p * 4, r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
     const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
-    if (max < 0.45) { dark++; continue; }
-    if (max < 0.65 || d / max < 0.45) continue;   // lit lamps are bright and colourful
-    let hue;
-    if (max === r) hue = ((g - b) / d) % 6; else if (max === g) hue = (b - r) / d + 2; else hue = (r - g) / d + 4;
+    if (max < 0.6 || d / max < 0.25) continue;
+    let hue; if (max === r) hue = ((g - b) / d) % 6; else if (max === g) hue = (b - r) / d + 2; else hue = (r - g) / d + 4;
     hue *= 60; if (hue < 0) hue += 360;
-    const c = (hue < 18 || hue > 335) ? 'red' : hue < 70 ? 'yellow' : (hue >= 80 && hue <= 200) ? 'green' : null;
-    if (c) { cnt[c]++; sy[c] += Math.floor(p / w); sx[c] += p % w; }
+    const vivid = d / max > 0.55;
+    if (hue < 20 || hue > 325) { if (vivid) redV++; }
+    else if (hue < 70) { if (vivid) { yelV++; yx += p % w; yy += Math.floor(p / w); } }
+    else if (hue >= 90 && hue <= 200) grn++;
   }
-  const colour = cnt.red >= cnt.yellow && cnt.red >= cnt.green ? 'red' : cnt.yellow >= cnt.green ? 'yellow' : 'green';
-  const lit = cnt[colour];
-  if (lit < 4 || lit < n * 0.015) return 'none';   // nothing lit
-  if (lit > n * 0.5) return 'none';                // big coloured surface: a sign, not a lamp
-  if (dark < n * 0.2) return 'none';               // no dark housing around it
-  const posY = (sy[colour] / lit + 0.5) / h;        // 0 = top, 1 = bottom
-  const posX = (sx[colour] / lit + 0.5) / w;        // 0 = left, 1 = right
-  if (colour === 'yellow') {
-    // Orange street lamps (sodium vapour) look like amber. Accept amber only as the middle lamp
-    // of a clearly long housing; a lone glowing lamp is not a traffic light.
-    if (lit > n * 0.35) return 'none';
-    if (h >= w * 1.6) { if (posY < 0.33 || posY > 0.67) return 'none'; }
-    else if (w >= h * 1.6) { if (posX < 0.33 || posX > 0.67) return 'none'; }
-    else return 'none';
-  } else if (h >= w * 1.3) {                        // upright housing: red on top, green at the bottom
-    if (colour === 'red' && posY > 0.5) return 'none';
-    if (colour === 'green' && posY < 0.5) return 'none';
+  const need = Math.max(4, n * 0.05);
+  if (redV >= need && redV >= grn && redV >= yelV) return 'red';
+  if (grn >= Math.max(4, n * 0.03) && grn >= yelV) return 'green';
+  if (yelV >= need) {
+    const upright = h >= w * 1.6, sideways = w >= h * 1.6;
+    if (!upright && !sideways) return 'none';
+    const pos = upright ? (yy / yelV + 0.5) / h : (yx / yelV + 0.5) / w;
+    return pos >= 0.33 && pos <= 0.67 ? 'yellow' : 'none';
   }
-  return colour;
+  return 'none';
+}
+
+// The light that counts: the biggest lit box that is not too small and not down at road level
+// (reflective road posts and the car bonnet sit in the bottom part of the picture).
+function pickLight(boxes, frameH, minBox) {
+  let best = null;
+  for (const b of boxes) {
+    if (b.colour === 'none' || b.y + b.h / 2 > frameH * 0.62 || Math.max(b.w, b.h) / frameH < minBox) continue;
+    if (!best || b.w * b.h > best.w * best.h) best = b;
+  }
+  return best ? best.colour : 'none';
+}
+
+// Just after driving through on green, red lights for the other roads of the junction come into
+// view. For a few seconds after the last green sighting, red and yellow are not counted.
+const GREEN_GRACE_MS = 5000;
+function afterGreen(colour, msSinceGreen) {
+  return (colour === 'red' || colour === 'yellow') && msSinceGreen < GREEN_GRACE_MS ? 'none' : colour;
+}
+
+// Is the car close to a known traffic signal that lies ahead? signals: [{lat, lon}].
+function nearSignal(pos, heading, signals, radius) {
+  let nearest = null, near = false;
+  for (const s of signals) {
+    const d = haversine(pos, s);
+    if (nearest == null || d < nearest) nearest = d;
+    if (d > radius) continue;
+    if (heading == null || d < 40) { near = true; continue; }
+    let diff = Math.abs(bearingDeg(pos, s) - heading) % 360; if (diff > 180) diff = 360 - diff;
+    if (diff <= 80) near = true;
+  }
+  return { near, nearest, count: signals.length };
 }
 
 // Light state from recent sightings ({t, colour}). Needs two sightings within the window,
@@ -261,12 +347,15 @@ function haversine(a, b) { // metres
 if (typeof document !== 'undefined') (function () {
   const $ = id => document.getElementById(id);
   const video = $('video'), overlay = $('overlay'), octx = overlay.getContext('2d');
-  const work = document.createElement('canvas'), wctx = work.getContext('2d', { willReadFrequently: true });
+  const frameC = document.createElement('canvas'), fctx = frameC.getContext('2d', { willReadFrequently: true });   // full camera frame
+  const netC = document.createElement('canvas'), nctx = netC.getContext('2d', { willReadFrequently: true });       // detector input
+  netC.width = netC.height = NET;
 
   const S = {
     running: false, camera: false, model: null,
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
-    hist: [], camLight: 'none',
+    hist: [], camLight: 'none', boxes: [], passMs: 0, greenAt: 0,
+    gate: 'near', mapSignals: [], marks: [], sigAt: null, sigTry: 0, sigBusy: false,
     manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
     margin: 5, minBox: 0.01, yellowAlarm: true,
     test: false, testSpeed: 0, testLight: 'camera',
@@ -317,7 +406,12 @@ if (typeof document !== 'undefined') (function () {
     const lv = $('lightVal');
     lv.textContent = light === 'none' ? '--' : light[0].toUpperCase() + light.slice(1);
     lv.className = 'val ' + light;
-    $('lightSub').innerHTML = (S.test && S.testLight !== 'camera') ? 'test' : S.camera ? 'camera' : 'no camera';
+    const gi = gateInfo();
+    $('lightSub').textContent = (S.test && S.testLight !== 'camera') ? 'test' : !S.camera ? 'no camera' : gi.open ? 'camera' : 'paused';
+    $('sigInfo').textContent = !S.lastFix ? 'Waiting for GPS. Known signals: ' + gi.count + '.'
+      : 'Known signals nearby: ' + gi.count + ' (' + S.marks.length + ' marked by you). Nearest: ' +
+        (gi.nearest == null ? 'none' : Math.round(gi.nearest) + ' m') + '. ' +
+        (S.gate === 'all' ? 'Checking everywhere.' : gi.near ? 'Signal ahead: checking for red.' : 'No signal ahead: red light check paused.');
 
     const b = $('banner');
     if (!S.running) { b.className = ''; b.textContent = 'Not running'; setAlarm(null); return; }
@@ -345,7 +439,7 @@ if (typeof document !== 'undefined') (function () {
       else if (!S.headFix) S.headFix = fix;
       else if (haversine(S.headFix, fix) > 12) { S.heading = bearingDeg(S.headFix, fix); S.headFix = fix; }
       S.gpsAcc = c.accuracy; S.lastFix = fix;
-      maybeLookup(fix);
+      maybeLookup(fix); maybeSignals(fix);
     }, err => {
       log('GPS: ' + (err.code === 1 ? 'permission denied. Allow location for this page.' : 'no signal yet.'));
     }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
@@ -387,6 +481,32 @@ if (typeof document !== 'undefined') (function () {
     S.lookupBusy = false;
   }
 
+  /* ---------- known traffic signals (map + marked by the driver) ---------- */
+  const GATE_M = 200;     // start checking for red this far before a known signal
+  try { S.marks = JSON.parse(localStorage.getItem('ctw-marks') || '[]'); } catch (e) { S.marks = []; }
+  try { if (localStorage.getItem('ctw-gate') === 'all') S.gate = 'all'; } catch (e) {}
+  async function maybeSignals(fix) {
+    if (S.sigBusy || Date.now() - S.sigTry < 20000) return;
+    if (S.sigAt && haversine(S.sigAt, fix) < 1500) return;
+    S.sigBusy = true; S.sigTry = Date.now();
+    try {
+      const q = '[out:json][timeout:15];node(around:3500,' + fix.lat.toFixed(5) + ',' + fix.lon.toFixed(5) + ')[highway=traffic_signals];out;';
+      const r = await fetch('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q));
+      if (r.ok) {
+        S.mapSignals = ((await r.json()).elements || []).filter(e => e.lat != null).map(e => ({ lat: e.lat, lon: e.lon }));
+        S.sigAt = fix;
+      }
+    } catch (e) { /* offline: try again later */ }
+    S.sigBusy = false;
+  }
+  // open = the camera's red/yellow result may be used now
+  function gateInfo() {
+    const all = S.mapSignals.concat(S.marks);
+    const g = S.lastFix ? nearSignal(S.lastFix, S.heading, all, GATE_M) : { near: false, nearest: null, count: all.length };
+    g.open = S.gate === 'all' || S.test || g.near;
+    return g;
+  }
+
   /* ---------- camera + detection ---------- */
   function loadScript(src) {
     return new Promise((res, rej) => {
@@ -394,12 +514,27 @@ if (typeof document !== 'undefined') (function () {
       document.head.appendChild(s);
     });
   }
+  async function download(url, label) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(label + ' could not be downloaded (' + r.status + ')');
+    if (!r.body) return await r.arrayBuffer();
+    const reader = r.body.getReader(), parts = []; let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read(); if (done) break;
+      parts.push(value); got += value.length; log(label + ': ' + (got / 1e6).toFixed(1) + ' MB');
+    }
+    const out = new Uint8Array(got); let o = 0;
+    for (const c of parts) { out.set(c, o); o += c.length; }
+    return out.buffer;
+  }
   async function loadModel() {
     if (S.model) return;
-    log('Loading traffic light detector (first time takes a while)...');
-    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
-    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js');
-    S.model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    log('Loading detector (first time takes a while)...');
+    await loadScript('vendor/ort/ort.wasm.min.js');
+    ort.env.wasm.wasmPaths = new URL('vendor/ort/', location.href).href;
+    ort.env.wasm.numThreads = 1;
+    const buf = await download('models/yolo11n.onnx', 'Loading detector');
+    S.model = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
     log('Detector ready.');
   }
   /* The phone has several back cameras (normal, ultra wide, telephoto). The choice is remembered. */
@@ -448,63 +583,54 @@ if (typeof document !== 'undefined') (function () {
     video.srcObject = null; S.camera = false; octx.clearRect(0, 0, overlay.width, overlay.height);
   }
 
-  // Runs the detector on one region of the camera picture. Small regions act as a zoom,
-  // so a distant light fills more of what the detector sees.
-  async function detectRegion(g, vw, vh, boxes) {
-    const sx = Math.round(g[0] * vw), sy = Math.round(g[1] * vh), sw = Math.round(g[2] * vw), sh = Math.round(g[3] * vh);
-    if (work.width !== sw || work.height !== sh) { work.width = sw; work.height = sh; }
-    wctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
-    const preds = await S.model.detect(work, 20, 0.25);
-    for (const p of preds) {
-      if (p.class !== 'traffic light') continue;
-      const x = Math.max(0, Math.floor(p.bbox[0])), y = Math.max(0, Math.floor(p.bbox[1]));
-      const w = Math.min(sw - x, Math.ceil(p.bbox[2])), h = Math.min(sh - y, Math.ceil(p.bbox[3]));
-      if (w < 3 || h < 3) continue;
-      const colour = analyseBox(wctx.getImageData(x, y, w, h).data, w, h);
-      boxes.push({ x: sx + x, y: sy + y, w, h, colour, far: Math.max(w, h) / vh < S.minBox });
-    }
-  }
-
-  // Regions as fractions of the picture: [x, y, width, height].
-  const FULL = [0, 0, 1, 0.7];                        // whole view, upper part: nearby lights
-  const ZONE = [0.11, 0.27, 0.78, 0.25];              // far zone shown on screen
-  const TILES = [                                     // zoomed passes
-    [0.25, 0.12, 0.5, 0.45],                          // 2x centre
-    [0.11, 0.27, 0.28, 0.25], [0.36, 0.27, 0.28, 0.25], [0.61, 0.27, 0.28, 0.25],  // 4x, across the far zone
-  ];
-  let cycle = 0;
+  // Parts of the picture to search, as fractions [x, y, width, height]. The whole view finds nearby
+  // signals; the three zoomed parts find distant ones. One part is searched per look, centre most often.
+  const LOOKS = [[0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0, 0.1, 0.4, 0.6], [0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0.6, 0.1, 0.4, 0.6]];
+  let look = 0;
   async function detectLoop() {
     if (!S.running) return;
     try {
       if (S.model && S.camera && video.readyState >= 2 && video.videoWidth) {
-        const vw = video.videoWidth, vh = video.videoHeight, boxes = [];
-        await detectRegion(FULL, vw, vh, boxes);
-        await detectRegion(TILES[(cycle * 2) % 4], vw, vh, boxes);
-        await detectRegion(TILES[(cycle * 2 + 1) % 4], vw, vh, boxes);
-        cycle++;
-        let best = null;
-        for (const b of boxes) if (!b.far && b.colour !== 'none' && (!best || b.w * b.h > best.area)) best = { colour: b.colour, area: b.w * b.h };
-        const now = Date.now();
-        if (best) S.hist.push({ t: now, colour: best.colour });
+        const vw = video.videoWidth, vh = video.videoHeight, g = LOOKS[look++ % LOOKS.length];
+        const reg = { x: Math.round(g[0] * vw), y: Math.round(g[1] * vh), w: Math.round(g[2] * vw), h: Math.round(g[3] * vh) };
+        if (frameC.width !== vw || frameC.height !== vh) { frameC.width = vw; frameC.height = vh; }
+        fctx.drawImage(video, 0, 0, vw, vh);                       // freeze one frame for both steps below
+        const lb = letterbox(reg.w, reg.h);
+        nctx.fillStyle = 'rgb(114,114,114)'; nctx.fillRect(0, 0, NET, NET);
+        nctx.drawImage(frameC, reg.x, reg.y, reg.w, reg.h, lb.padX, lb.padY, lb.dw, lb.dh);
+        const t0 = performance.now();
+        const res = await S.model.run({ [S.model.inputNames[0]]: new ort.Tensor('float32', toTensor(nctx.getImageData(0, 0, NET, NET).data), [1, 3, NET, NET]) });
+        const o = res[S.model.outputNames[0]];
+        S.passMs = S.passMs ? S.passMs * 0.8 + (performance.now() - t0) * 0.2 : performance.now() - t0;
+        const now = Date.now(), found = [];
+        for (const b of decodeLights(o.data, o.dims[2], reg, lb, 0.2)) {
+          const x = Math.max(0, Math.floor(b.x)), y = Math.max(0, Math.floor(b.y));
+          const w = Math.min(vw - x, Math.ceil(b.w)), h = Math.min(vh - y, Math.ceil(b.h));
+          if (w < 3 || h < 3) continue;
+          found.push({ x, y, w, h, score: b.score, t: now, colour: lampColour(fctx.getImageData(x, y, w, h).data, w, h) });
+        }
+        // keep recent boxes from the parts not searched this time
+        const inReg = b => { const cx = b.x + b.w / 2, cy = b.y + b.h / 2; return cx >= reg.x && cx <= reg.x + reg.w && cy >= reg.y && cy <= reg.y + reg.h; };
+        S.boxes = nms(found.concat(S.boxes.filter(b => now - b.t < 1500 && !inReg(b))), 0.4);
+        const open = gateInfo().open, seen = open ? pickLight(S.boxes, vh, S.minBox) : 'none';
+        if (seen === 'green') S.greenAt = now;
+        const colour = afterGreen(seen, now - S.greenAt);
+        if (colour !== 'none') S.hist.push({ t: now, colour });
         while (S.hist.length && now - S.hist[0].t > SIGHT_MS) S.hist.shift();
         S.camLight = smoothLight(S.hist, now);
         if (overlay.width !== vw || overlay.height !== vh) { overlay.width = vw; overlay.height = vh; }
         const lw = Math.max(2, vw / 320);
         octx.clearRect(0, 0, vw, vh);
-        octx.lineWidth = lw; octx.setLineDash([lw * 4, lw * 4]); octx.strokeStyle = 'rgba(255,255,255,.55)';
-        octx.strokeRect(ZONE[0] * vw, ZONE[1] * vh, ZONE[2] * vw, ZONE[3] * vh);
-        octx.setLineDash([]);
-        octx.font = Math.round(vw / 45) + 'px system-ui, sans-serif'; octx.fillStyle = 'rgba(255,255,255,.7)';
-        octx.fillText('far zone', ZONE[0] * vw + lw * 2, ZONE[1] * vh - lw * 2);
-        for (const b of boxes) {
-          const ignored = b.far || b.colour === 'none';
+        for (const b of S.boxes) {
+          const ignored = !open || b.colour === 'none' || b.y + b.h / 2 > vh * 0.62 || Math.max(b.w, b.h) / vh < S.minBox;
           octx.lineWidth = ignored ? lw / 2 : lw;
           octx.strokeStyle = ignored ? '#8b96a5' : b.colour === 'red' ? '#ff4d4d' : b.colour === 'yellow' ? '#ffb020' : '#2fd67a';
           octx.strokeRect(b.x, b.y, b.w, b.h);
         }
+        if (look % 6 === 0) log('Detector: ' + Math.round(S.passMs) + ' ms per look.');
       }
-    } catch (e) { log('Detector error: ' + e.message); }
-    setTimeout(detectLoop, 40);
+    } catch (e) { log('Detector error: ' + (e.message || e)); }
+    setTimeout(detectLoop, 30);
   }
 
   /* ---------- start / stop ---------- */
@@ -536,7 +662,7 @@ if (typeof document !== 'undefined') (function () {
   function stop() {
     S.running = false; $('startBtn').textContent = 'Start'; $('startBtn').classList.remove('stop');
     clearInterval(renderTimer); if (watchId != null) navigator.geolocation.clearWatch(watchId); watchId = null;
-    stopCamera(); S.hist = []; S.camLight = 'none'; S.gpsSpeed = null;
+    stopCamera(); S.hist = []; S.boxes = []; S.greenAt = 0; S.camLight = 'none'; S.gpsSpeed = null;
     if (wake) { try { wake.release(); } catch (e) {} wake = null; }
     $('stageMsg').classList.remove('hide'); $('stageMsg').textContent = 'Stopped. Press Start to run again.';
     render();
@@ -556,12 +682,30 @@ if (typeof document !== 'undefined') (function () {
     render();
   });
   $('marginSel').addEventListener('change', e => { S.margin = Number(e.target.value); });
+  $('gateSel').value = S.gate;
+  $('gateSel').addEventListener('change', e => {
+    S.gate = e.target.value; try { localStorage.setItem('ctw-gate', S.gate); } catch (err) {}
+    render();
+  });
+  const saveMarks = () => { try { localStorage.setItem('ctw-marks', JSON.stringify(S.marks)); } catch (err) {} };
+  $('markBtn').addEventListener('click', () => {
+    if (!S.lastFix) { log('No GPS position yet. Press Start and wait for GPS, then mark.'); return; }
+    S.marks.push({ lat: S.lastFix.lat, lon: S.lastFix.lon }); saveMarks();
+    log('Signal marked here. Marked by you: ' + S.marks.length + '.'); render();
+  });
+  $('unmarkBtn').addEventListener('click', () => {
+    if (!S.lastFix || !S.marks.length) { log('No marked signal to remove.'); return; }
+    let bi = 0; for (let k = 1; k < S.marks.length; k++) if (haversine(S.lastFix, S.marks[k]) < haversine(S.lastFix, S.marks[bi])) bi = k;
+    const d = Math.round(haversine(S.lastFix, S.marks[bi]));
+    if (d > 300) { log('Your nearest mark is ' + d + ' m away. Go within 300 m to remove it.'); return; }
+    S.marks.splice(bi, 1); saveMarks(); log('Removed your mark (' + d + ' m away).'); render();
+  });
   $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
   $('camSel').addEventListener('change', async e => {
     try { localStorage.setItem(CAM_KEY, e.target.value); } catch (err) {}
     if (!S.running || !S.camera) return;
     const old = video.srcObject; if (old) old.getTracks().forEach(t => t.stop());
-    try { video.srcObject = await openChosenCamera(); await video.play(); S.hist = []; fitStage(); }
+    try { video.srcObject = await openChosenCamera(); await video.play(); S.hist = []; S.boxes = []; fitStage(); }
     catch (err) { log('Could not switch camera: ' + (err.message || err)); }
   });
   try { S.ttKey = localStorage.getItem('ctw-ttkey') || ''; } catch (e) {}
