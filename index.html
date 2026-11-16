@@ -116,9 +116,6 @@
         <option value="0.05">Near (warns late)</option>
       </select>
     </label>
-    <label class="line">Horizon line: <span id="hzLab">50%</span></label>
-    <input type="range" id="hzRange" min="20" max="80" step="1" value="50">
-    <p class="note">Park on a flat, straight road and move this until the blue line sits where the road meets the sky far ahead. Lights below the line (brake lights) and tiny lights far above it (building tops) are ignored. Set it again if the camera is moved.</p>
     <label class="line">Alarm on yellow light
       <button id="yellowBtn" class="on">On</button>
     </label>
@@ -187,29 +184,6 @@ function analyseBox(data, w, h) {
     if (colour === 'green' && posY < 0.5) return 'none';
   }
   return colour;
-}
-
-// Position check. A signal hangs above the driver's eye level, so in the picture it sits above
-// the horizon line, and the higher it sits the bigger it looks. "ratio" is how many box-lengths
-// the box is above the horizon.
-//   brake lights of cars ahead: below the horizon (ratio under 0)      -> rejected
-//   red lamps on top of buildings and towers: tiny and very high (ratio 50+) -> rejected
-//   signals on poles and gantries: ratio about 1 to 15                  -> accepted
-function geometryOk(centreY, boxLen, horizonY) {
-  const ratio = (horizonY - centreY) / boxLen;
-  return ratio >= 0.5 && ratio <= 18;
-}
-
-// Parts of the picture to search, as fractions [x, y, width, height], placed around the horizon.
-function regions(hz) {
-  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-  const zy = clamp(hz - 0.21, 0, 0.75);
-  return {
-    full: [0, 0, 1, Math.min(1, hz + 0.06)],             // everything above the horizon: nearby signals
-    zone: [0.11, zy, 0.78, 0.25],                        // far zone shown on screen
-    tiles: [[0.25, clamp(hz - 0.40, 0, 0.55), 0.5, 0.45],  // 2x zoom
-      [0.11, zy, 0.28, 0.25], [0.36, zy, 0.28, 0.25], [0.61, zy, 0.28, 0.25]],  // 4x zoom along the horizon
-  };
 }
 
 // Light state from recent sightings ({t, colour}). Needs two sightings within the window,
@@ -294,7 +268,7 @@ if (typeof document !== 'undefined') (function () {
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
     hist: [], camLight: 'none',
     manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
-    margin: 5, minBox: 0.01, yellowAlarm: true, horizon: 0.5,
+    margin: 5, minBox: 0.01, yellowAlarm: true,
     test: false, testSpeed: 0, testLight: 'camera',
   };
 
@@ -486,22 +460,27 @@ if (typeof document !== 'undefined') (function () {
       const x = Math.max(0, Math.floor(p.bbox[0])), y = Math.max(0, Math.floor(p.bbox[1]));
       const w = Math.min(sw - x, Math.ceil(p.bbox[2])), h = Math.min(sh - y, Math.ceil(p.bbox[3]));
       if (w < 3 || h < 3) continue;
-      const placed = geometryOk(sy + y + h / 2, Math.max(w, h), S.horizon * vh);
-      const colour = placed ? analyseBox(wctx.getImageData(x, y, w, h).data, w, h) : 'none';
+      const colour = analyseBox(wctx.getImageData(x, y, w, h).data, w, h);
       boxes.push({ x: sx + x, y: sy + y, w, h, colour, far: Math.max(w, h) / vh < S.minBox });
     }
   }
 
+  // Regions as fractions of the picture: [x, y, width, height].
+  const FULL = [0, 0, 1, 0.7];                        // whole view, upper part: nearby lights
+  const ZONE = [0.11, 0.27, 0.78, 0.25];              // far zone shown on screen
+  const TILES = [                                     // zoomed passes
+    [0.25, 0.12, 0.5, 0.45],                          // 2x centre
+    [0.11, 0.27, 0.28, 0.25], [0.36, 0.27, 0.28, 0.25], [0.61, 0.27, 0.28, 0.25],  // 4x, across the far zone
+  ];
   let cycle = 0;
   async function detectLoop() {
     if (!S.running) return;
     try {
       if (S.model && S.camera && video.readyState >= 2 && video.videoWidth) {
         const vw = video.videoWidth, vh = video.videoHeight, boxes = [];
-        const R = regions(S.horizon), ZONE = R.zone;
-        await detectRegion(R.full, vw, vh, boxes);
-        await detectRegion(R.tiles[(cycle * 2) % 4], vw, vh, boxes);
-        await detectRegion(R.tiles[(cycle * 2 + 1) % 4], vw, vh, boxes);
+        await detectRegion(FULL, vw, vh, boxes);
+        await detectRegion(TILES[(cycle * 2) % 4], vw, vh, boxes);
+        await detectRegion(TILES[(cycle * 2 + 1) % 4], vw, vh, boxes);
         cycle++;
         let best = null;
         for (const b of boxes) if (!b.far && b.colour !== 'none' && (!best || b.w * b.h > best.area)) best = { colour: b.colour, area: b.w * b.h };
@@ -517,8 +496,6 @@ if (typeof document !== 'undefined') (function () {
         octx.setLineDash([]);
         octx.font = Math.round(vw / 45) + 'px system-ui, sans-serif'; octx.fillStyle = 'rgba(255,255,255,.7)';
         octx.fillText('far zone', ZONE[0] * vw + lw * 2, ZONE[1] * vh - lw * 2);
-        octx.strokeStyle = '#4da3ff'; octx.beginPath(); octx.moveTo(0, S.horizon * vh); octx.lineTo(vw, S.horizon * vh); octx.stroke();
-        octx.fillStyle = '#4da3ff'; octx.fillText('horizon', lw * 2, S.horizon * vh - lw * 2);
         for (const b of boxes) {
           const ignored = b.far || b.colour === 'none';
           octx.lineWidth = ignored ? lw / 2 : lw;
@@ -593,12 +570,6 @@ if (typeof document !== 'undefined') (function () {
     S.ttKey = e.target.value.trim(); S.ttError = false; S.lastLookup = null;   // look up again straight away
     try { localStorage.setItem('ctw-ttkey', S.ttKey); } catch (err) {}
   });
-  function setHorizon(pct) {
-    S.horizon = pct / 100; $('hzRange').value = pct; $('hzLab').textContent = pct + '%';
-    try { localStorage.setItem('ctw-horizon', String(pct)); } catch (e) {}
-  }
-  try { const h = Number(localStorage.getItem('ctw-horizon')); if (h >= 20 && h <= 80) setHorizon(h); } catch (e) {}
-  $('hzRange').addEventListener('input', e => setHorizon(Number(e.target.value)));
   function setYellow(on) {
     S.yellowAlarm = on; $('yellowBtn').textContent = on ? 'On' : 'Off'; $('yellowBtn').classList.toggle('on', on);
     try { localStorage.setItem('ctw-yellow', on ? '1' : '0'); } catch (e) {}
