@@ -445,6 +445,25 @@ if (typeof document !== 'undefined') (function () {
     }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
   }
 
+  /* ---------- OpenStreetMap queries ---------- */
+  // The public map servers are often busy, so several are tried in turn; the last one that worked goes first.
+  const MAP_SERVERS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter'];
+  let mapServer = 0;
+  async function askMap(query) {
+    let last = 'no answer';
+    for (let k = 0; k < MAP_SERVERS.length; k++) {
+      const idx = (mapServer + k) % MAP_SERVERS.length, ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 12000);
+      try {
+        const r = await fetch(MAP_SERVERS[idx] + '?data=' + encodeURIComponent(query), { signal: ctl.signal });
+        if (r.ok) { const j = await r.json(); mapServer = idx; return j; }
+        last = 'busy (' + r.status + ')';
+      } catch (e) { last = e.name === 'AbortError' ? 'too slow' : 'no internet'; }
+      finally { clearTimeout(timer); }
+    }
+    throw new Error(last);
+  }
+
   /* ---------- speed limit from map ---------- */
   async function maybeLookup(fix) {
     if (S.lookupBusy) return;
@@ -472,12 +491,9 @@ if (typeof document !== 'undefined') (function () {
     if (!found) try {                                // 2) OpenStreetMap
       const q = '[out:json][timeout:8];way(around:40,' + fix.lat.toFixed(6) + ',' + fix.lon.toFixed(6) +
         ')[highway];out tags geom;';
-      const r = await fetch('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q));
-      if (r.ok) {
-        const m = matchRoad((await r.json()).elements, fix, S.heading);
-        S.mapLimit = m ? m.limit : null; S.mapRoad = m ? m.road : null; S.mapSrc = 'map';
-      }
-    } catch (e) { /* offline or blocked: keep last value */ }
+      const m = matchRoad((await askMap(q)).elements, fix, S.heading);
+      S.mapLimit = m ? m.limit : null; S.mapRoad = m ? m.road : null; S.mapSrc = 'map';
+    } catch (e) { /* offline or servers busy: keep last value */ }
     S.lookupBusy = false;
   }
 
@@ -491,12 +507,9 @@ if (typeof document !== 'undefined') (function () {
     S.sigBusy = true; S.sigTry = Date.now(); if (!S.sigAt) S.sigState = 'loading...';
     try {
       const q = '[out:json][timeout:15];node(around:3500,' + fix.lat.toFixed(5) + ',' + fix.lon.toFixed(5) + ')[highway=traffic_signals];out;';
-      const r = await fetch('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q));
-      if (r.ok) {
-        S.mapSignals = ((await r.json()).elements || []).filter(e => e.lat != null).map(e => ({ lat: e.lat, lon: e.lon }));
-        S.sigAt = fix; S.sigState = 'loaded';
-      } else if (!S.sigAt) S.sigState = 'map did not answer, will retry';
-    } catch (e) { if (!S.sigAt) S.sigState = 'no internet for the map, will retry'; }
+      S.mapSignals = ((await askMap(q)).elements || []).filter(e => e.lat != null).map(e => ({ lat: e.lat, lon: e.lon }));
+      S.sigAt = fix; S.sigState = 'loaded';
+    } catch (e) { if (!S.sigAt) S.sigState = 'map servers ' + e.message + ', will retry'; }
     S.sigBusy = false;
   }
   // open = the camera's red/yellow result may be used now
