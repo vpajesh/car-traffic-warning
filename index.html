@@ -132,9 +132,9 @@
       <select id="camSel"><option value="">Default</option></select>
     </label>
     <label class="line">Camera detail
-      <select id="resSel"><option value="high">High (4K if the camera has it)</option><option value="normal">Normal</option></select>
+      <select id="resSel"><option value="normal">Normal</option><option value="high">High (4K, experimental)</option></select>
     </label>
-    <div id="resInfo" class="note">High shows far signals and boards more clearly. If the phone gets slow or hot, choose Normal.</div>
+    <div id="resInfo" class="note">Normal is the tested setting. High gives a sharper picture but has more to search, and on the road it found signals later.</div>
     <div id="focusInfo" class="note">Focus: not set yet.</div>
     <label class="line">Traffic light distance
       <select id="distSel">
@@ -422,6 +422,29 @@ function zoomPatch(vw, vh, cx, cy, k, n) {
   const w = Math.min(1, NET / vw), h = Math.min(1, NET / vh);
   const x = cx + (k - (n - 1) / 2) * w - w / 2;
   return [Math.max(0, Math.min(1 - w, x)), Math.max(0, Math.min(1 - h, cy - h / 2)), w, h];
+}
+
+// Zoomed looks for traffic lights: a grid of full-sharpness patches over the upper part of the
+// picture, where signals appear. Returns rows of patches (top row first), each row centre patch first.
+// A normal picture gets one patch; a 4K picture gets two rows of two or three.
+function zoomGrid(vw, vh) {
+  const cols = zoomCount(vw, 0.45), rows = Math.max(1, Math.round(0.5 * vh / NET)), h = Math.min(1, NET / vh), grid = [];
+  const order = []; for (let k = 0; k < cols; k++) order.push(k);
+  const mid = (cols - 1) / 2; order.sort((a, b) => Math.abs(a - mid) - Math.abs(b - mid));
+  for (let r = 0; r < rows; r++) {
+    const cy = rows === 1 ? 0.38 : 0.02 + h / 2 + r * h;
+    grid.push(order.map(k => zoomPatch(vw, vh, 0.5, cy, k, cols)));
+  }
+  return grid;
+}
+// Which patch to look at on zoomed look number z. favRow: the row where signals were seen before
+// (or -1); it gets two looks in three.
+function zoomPick(grid, z, favRow) {
+  const rows = grid.length;
+  let r = z % rows;
+  if (rows > 1 && favRow >= 0) r = z % 3 === 2 ? (favRow + 1 + Math.floor(z / 3) % (rows - 1)) % rows : favRow;
+  const row = grid[r];
+  return row[Math.floor(z / rows) % row.length];
 }
 
 // Light state from recent sightings ({t, colour}). Needs two sightings within the window,
@@ -741,7 +764,7 @@ if (typeof document !== 'undefined') (function () {
   const CAM_KEY = 'ctw-camera';
   const savedCam = () => { try { return localStorage.getItem(CAM_KEY) || ''; } catch (e) { return ''; } };
   const RES_KEY = 'ctw-res';
-  const savedRes = () => { try { return localStorage.getItem(RES_KEY) === 'normal' ? 'normal' : 'high'; } catch (e) { return 'high'; } };
+  const savedRes = () => { try { return localStorage.getItem(RES_KEY) === 'high' ? 'high' : 'normal'; } catch (e) { return 'normal'; } };
   function openStream(deviceId) {
     const hi = savedRes() === 'high';
     const pick = deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: 'environment' } };
@@ -825,10 +848,16 @@ if (typeof document !== 'undefined') (function () {
   const WIDE_LOOKS = [[0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0, 0.1, 0.4, 0.6], [0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0.6, 0.1, 0.4, 0.6]];
   // Every third look is a zoomed one (the patches across the middle of the road in turn); the others
   // go round the wide looks.
+  let tlY = null;      // where signals have been seen, as a share of the picture height (kept between drives)
+  try { const v = parseFloat(localStorage.getItem('ctw-tly')); if (v >= 0 && v <= 1) tlY = v; } catch (e) {}
   function nextLightLook(step, vw, vh) {
-    if (step % 3 !== 0) return WIDE_LOOKS[(step - Math.floor(step / 3) - 1) % WIDE_LOOKS.length];
-    const n = zoomCount(vw, 0.45);
-    return zoomPatch(vw, vh, 0.5, 0.38, (step / 3) % n, n);
+    const grid = zoomGrid(vw, vh), many = grid.length * grid[0].length > 1;
+    // one patch: every third look is zoomed. Several patches (4K): two looks in three are zoomed.
+    const zoomed = many ? step % 3 !== 0 : step % 3 === 0;
+    if (!zoomed) { const w = many ? Math.floor(step / 3) : step - Math.floor(step / 3) - 1; return WIDE_LOOKS[w % WIDE_LOOKS.length]; }
+    const z = many ? step - Math.floor(step / 3) - 1 : step / 3;
+    const fav = tlY == null ? -1 : grid.findIndex(row => tlY >= row[0][1] && tlY <= row[0][1] + row[0][3]);
+    return zoomPick(grid, z, fav);
   }
   let lightStep = 0, lightTrack = null, lightTrackUntil = 0;   // lightTrack: the area around a signal that was just seen
   async function lightLook(vw, vh) {
@@ -845,7 +874,10 @@ if (typeof document !== 'undefined') (function () {
     const inReg = b => { const cx = b.x + b.w / 2, cy = b.y + b.h / 2; return cx >= reg.x && cx <= reg.x + reg.w && cy >= reg.y && cy <= reg.y + reg.h; };
     S.boxes = nms(found.concat(S.boxes.filter(b => now - b.t < 1500 && !inReg(b))), 0.4);
     const cand = found.filter(b => b.y + b.h / 2 <= vh * 0.62).sort((a, b) => (b.colour !== 'none') - (a.colour !== 'none') || b.w * b.h - a.w * a.h)[0];
-    if (cand) { lightTrack = trackRegion(cand, vw, vh); lightTrackUntil = now + 2500; }
+    if (cand) {
+      lightTrack = trackRegion(cand, vw, vh); lightTrackUntil = now + 2500;
+      if (cand.colour !== 'none') { const y = (cand.y + cand.h / 2) / vh; tlY = tlY == null ? y : tlY * 0.8 + y * 0.2; try { localStorage.setItem('ctw-tly', tlY.toFixed(3)); } catch (e) {} }
+    }
     const seen = pickLight(S.boxes, vh, S.minBox, vw);
     if (seen === 'green') S.greenAt = now;
     const colour = afterGreen(seen, now - S.greenAt);
@@ -1054,7 +1086,7 @@ if (typeof document !== 'undefined') (function () {
   $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
   // Version shown on the page, and a check for a newer one on the site. version.json holds the
   // newest version; when it differs from this page's, a button offers the update.
-  const APP_VERSION = '2026-11-17 15:45', APP_NOTE = 'Starts again by itself after you come back from another app. Watches for red away from known signals, follows a signal once seen, sharper camera picture, reads boards with phone upright.';
+  const APP_VERSION = '2026-11-17 18:50', APP_NOTE = 'Camera detail back to Normal (4K found signals later on the road). Starts again by itself after you come back from another app. Watches for red away from known signals, follows a signal once seen, sharper camera picture, reads boards with phone upright.';
   $('verInfo').textContent = 'Version: ' + APP_VERSION + '. ' + APP_NOTE;
   let newVersion = null;
   async function checkVersion() {
