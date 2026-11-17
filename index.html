@@ -108,7 +108,7 @@
     <h2>Traffic signals</h2>
     <label class="line">Check for red lights
       <select id="gateSel">
-        <option value="near" selected>Only near known signals</option>
+        <option value="near" selected>Known signals, watch elsewhere</option>
         <option value="all">Everywhere</option>
       </select>
     </label>
@@ -117,7 +117,7 @@
       <button id="markBtn">Mark signal here</button>
       <button id="unmarkBtn">Remove my nearest mark</button>
     </div>
-    <p class="note">Signal positions come from OpenStreetMap. If a signal is missing, press "Mark signal here" while stopped at it; the phone remembers it. "Everywhere" checks all the time and gives more false alarms.</p>
+    <p class="note">Signal positions come from OpenStreetMap. Near a known signal the alarm comes after 2 sightings of red. Elsewhere the camera still watches and the alarm needs 3 sightings; a signal found this way is saved on this phone. "Mark signal here" saves one yourself while stopped at it. "Everywhere" uses 2 sightings all the time and gives more false alarms.</p>
   </section>
 
   <section>
@@ -131,6 +131,10 @@
     <label class="line">Camera
       <select id="camSel"><option value="">Default</option></select>
     </label>
+    <label class="line">Camera detail
+      <select id="resSel"><option value="high">High (4K if the camera has it)</option><option value="normal">Normal</option></select>
+    </label>
+    <div id="resInfo" class="note">High shows far signals and boards more clearly. If the phone gets slow or hot, choose Normal.</div>
     <div id="focusInfo" class="note">Focus: not set yet.</div>
     <label class="line">Traffic light distance
       <select id="distSel">
@@ -156,6 +160,8 @@
   </section>
   </div>
 
+  <button id="updBtn" class="hide" style="width:100%;margin:8px 0;background:#2b6cff;color:#fff">New version ready. Tap to update.</button>
+  <p class="note" id="verInfo">Version: --</p>
   <p class="note">Driver aid only. It can miss or misread lights and limits. Always watch the road yourself and do not touch the phone while driving.</p>
 </main>
 
@@ -397,14 +403,36 @@ function nearSignal(pos, heading, signals, radius) {
   return { near, nearest, count: signals.length };
 }
 
+// The part of the camera picture that is searched. A phone held upright sees the road only in the
+// top part and the dashboard below, so only the top half is used. Returns the height to use.
+function viewHeight(vw, vh) { return vh > vw * 1.2 ? Math.round(vh * 0.5) : vh; }
+
+// A point `metres` ahead of pos along heading (degrees). Used to save a signal that was seen ahead.
+function pointAhead(pos, heading, metres) {
+  const r = heading * Math.PI / 180, dLat = metres * Math.cos(r) / 111320;
+  return { lat: pos.lat + dLat, lon: pos.lon + metres * Math.sin(r) / (111320 * Math.cos(pos.lat * Math.PI / 180)) };
+}
+
+// Zoomed looks: patches of the picture at full sharpness (not shrunk). A sharper camera picture
+// needs more patches side by side to cover the same width. zoomCount: how many patches cover
+// `share` of the picture's width. zoomPatch: patch k of n, side by side around centre cx, at height cy.
+// Returns fractions [x, y, w, h].
+function zoomCount(vw, share) { return Math.max(1, Math.round(share * vw / NET)); }
+function zoomPatch(vw, vh, cx, cy, k, n) {
+  const w = Math.min(1, NET / vw), h = Math.min(1, NET / vh);
+  const x = cx + (k - (n - 1) / 2) * w - w / 2;
+  return [Math.max(0, Math.min(1 - w, x)), Math.max(0, Math.min(1 - h, cy - h / 2)), w, h];
+}
+
 // Light state from recent sightings ({t, colour}). Needs two sightings within the window,
 // so one odd frame cannot start the alarm and one missed frame cannot stop it.
 const SIGHT_MS = 2500;
-function smoothLight(sightings, now) {
+function smoothLight(sightings, now, need) {
+  need = need || 2;   // away from known signals three sightings are asked for
   const c = { red: 0, yellow: 0, green: 0 };
   for (const s of sightings) if (now - s.t <= SIGHT_MS && s.colour in c) c[s.colour]++;
-  if (c.red + c.yellow >= 2) return c.red >= c.yellow ? 'red' : 'yellow';
-  if (c.green >= 2) return 'green';
+  if (c.red + c.yellow >= need) return c.red >= c.yellow ? 'red' : 'yellow';
+  if (c.green >= need) return 'green';
   return 'none';
 }
 
@@ -540,11 +568,11 @@ if (typeof document !== 'undefined') (function () {
     lv.textContent = light === 'none' ? '--' : light[0].toUpperCase() + light.slice(1);
     lv.className = 'val ' + light;
     const gi = gateInfo();
-    $('lightSub').textContent = (S.test && S.testLight !== 'camera') ? 'test' : !S.camera ? 'no camera' : gi.open ? 'camera' : 'paused';
+    $('lightSub').textContent = (S.test && S.testLight !== 'camera') ? 'test' : !S.camera ? 'no camera' : gi.open ? 'camera' : 'watching';
     $('sigInfo').textContent = !S.lastFix ? 'Waiting for GPS. Known signals: ' + gi.count + '.'
-      : 'Map signals: ' + S.sigState + '. Known signals nearby: ' + gi.count + ' (' + S.marks.length + ' marked by you). Nearest: ' +
+      : 'Map signals: ' + S.sigState + '. Known signals nearby: ' + gi.count + ' (' + S.marks.length + ' saved on this phone). Nearest: ' +
         (gi.nearest == null ? 'none' : Math.round(gi.nearest) + ' m') + '. ' +
-        (S.gate === 'all' ? 'Checking everywhere.' : gi.near ? 'Signal ahead: checking for red.' : 'No signal ahead: red light check paused.');
+        (S.gate === 'all' ? 'Checking everywhere.' : gi.near ? 'Signal ahead: checking for red.' : 'No known signal ahead: watching for red, alarm after 3 sightings.');
 
     const b = $('banner');
     if (!S.running) { b.className = ''; b.textContent = 'Not running'; setAlarm(null); return; }
@@ -649,7 +677,7 @@ if (typeof document !== 'undefined') (function () {
   function gateInfo() {
     const all = S.mapSignals.concat(S.marks);
     const g = S.lastFix ? nearSignal(S.lastFix, S.heading, all, GATE_M) : { near: false, nearest: null, count: all.length };
-    g.open = S.gate === 'all' || S.test || g.near;
+    g.open = S.gate === 'all' || g.near;
     return g;
   }
 
@@ -712,10 +740,13 @@ if (typeof document !== 'undefined') (function () {
   /* The phone has several back cameras (normal, ultra wide, telephoto). The choice is remembered. */
   const CAM_KEY = 'ctw-camera';
   const savedCam = () => { try { return localStorage.getItem(CAM_KEY) || ''; } catch (e) { return ''; } };
+  const RES_KEY = 'ctw-res';
+  const savedRes = () => { try { return localStorage.getItem(RES_KEY) === 'normal' ? 'normal' : 'high'; } catch (e) { return 'high'; } };
   function openStream(deviceId) {
+    const hi = savedRes() === 'high';
     const pick = deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: 'environment' } };
     return navigator.mediaDevices.getUserMedia({
-      audio: false, video: Object.assign(pick, { width: { ideal: 1920 }, height: { ideal: 1080 } })
+      audio: false, video: Object.assign(pick, { width: { ideal: hi ? 3840 : 1920 }, height: { ideal: hi ? 2160 : 1080 } })
     });
   }
   // Keeps the camera focused on the road, not on the dashboard or the windscreen.
@@ -791,16 +822,20 @@ if (typeof document !== 'undefined') (function () {
   // One part is searched per look, the centre most often.
   // Zoomed look for far lights: a patch of the picture at full sharpness (not shrunk), up the road
   // ahead. A far light is only a few pixels once a big area is shrunk to the detector's size.
-  function zoomLook(vw, vh) {
-    const w = Math.min(1, NET / vw), h = Math.min(1, NET / vh);
-    return [(1 - w) / 2, Math.max(0, Math.min(1 - h, 0.38 - h / 2)), w, h];
-  }
   const WIDE_LOOKS = [[0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0, 0.1, 0.4, 0.6], [0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0.6, 0.1, 0.4, 0.6]];
-  // Every third look is the zoomed one; the others go round the wide looks as before.
-  function nextLightLook(step, vw, vh) { return step % 3 === 0 ? zoomLook(vw, vh) : WIDE_LOOKS[(step - Math.floor(step / 3) - 1) % WIDE_LOOKS.length]; }
-  let lightStep = 0;
+  // Every third look is a zoomed one (the patches across the middle of the road in turn); the others
+  // go round the wide looks.
+  function nextLightLook(step, vw, vh) {
+    if (step % 3 !== 0) return WIDE_LOOKS[(step - Math.floor(step / 3) - 1) % WIDE_LOOKS.length];
+    const n = zoomCount(vw, 0.45);
+    return zoomPatch(vw, vh, 0.5, 0.38, (step / 3) % n, n);
+  }
+  let lightStep = 0, lightTrack = null, lightTrackUntil = 0;   // lightTrack: the area around a signal that was just seen
   async function lightLook(vw, vh) {
-    const { o, reg, lb } = await runNet(S.model, nextLightLook(lightStep++, vw, vh), vw, vh), now = Date.now(), found = [];
+    // After a signal is seen, two looks in three go straight back to it (not shrunk), so it is confirmed quickly.
+    const tracking = lightTrack && Date.now() < lightTrackUntil && lightStep % 3 !== 0;
+    const { o, reg, lb } = await runNet(S.model, tracking ? lightTrack : nextLightLook(lightStep, vw, vh), vw, vh), now = Date.now(), found = [];
+    lightStep++;
     for (const d of decodeClasses(o.data, o.dims[2], [TL_CLASS], reg, lb, 0.2)) {
       const b = clampBox(d, vw, vh); if (b.w < 3 || b.h < 3) continue;
       b.score = d.score; b.t = now; b.colour = lampColour(fctx.getImageData(b.x, b.y, b.w, b.h).data, b.w, b.h);
@@ -809,6 +844,8 @@ if (typeof document !== 'undefined') (function () {
     // keep recent boxes from the parts not searched this time
     const inReg = b => { const cx = b.x + b.w / 2, cy = b.y + b.h / 2; return cx >= reg.x && cx <= reg.x + reg.w && cy >= reg.y && cy <= reg.y + reg.h; };
     S.boxes = nms(found.concat(S.boxes.filter(b => now - b.t < 1500 && !inReg(b))), 0.4);
+    const cand = found.filter(b => b.y + b.h / 2 <= vh * 0.62).sort((a, b) => (b.colour !== 'none') - (a.colour !== 'none') || b.w * b.h - a.w * a.h)[0];
+    if (cand) { lightTrack = trackRegion(cand, vw, vh); lightTrackUntil = now + 2500; }
     const seen = pickLight(S.boxes, vh, S.minBox, vw);
     if (seen === 'green') S.greenAt = now;
     const colour = afterGreen(seen, now - S.greenAt);
@@ -818,27 +855,28 @@ if (typeof document !== 'undefined') (function () {
   // Speed limit boards: zoomed right, right half, zoomed left, left half, whole view in turn. The zoomed
   // looks are a patch at full sharpness (not shrunk) beside the road ahead, so a board is found while
   // it is still far and small. Each board found is read; a number counts once two looks within 5 seconds agree.
-  function signZoom(vw, vh, right) {
-    const w = Math.min(1, NET / vw), h = Math.min(1, NET / vh);
-    return [right ? Math.min(1 - w, 0.5) : Math.max(0, 0.5 - w), Math.max(0, Math.min(1 - h, 0.4 - h / 2)), w, h];
-  }
   const SIGN_STEPS = 5;
   function signLookAt(step, vw, vh) {
+    const n = zoomCount(vw, 0.3), k = Math.floor(step / SIGN_STEPS) % n, w = Math.min(1, NET / vw);
     switch (step % SIGN_STEPS) {
-      case 0: return signZoom(vw, vh, true);
+      case 0: return zoomPatch(vw, vh, 0.5 + w / 2 + k * w, 0.4, 0, 1);      // right of the middle, moving outward
       case 1: return [0.5, 0.1, 0.5, 0.7];
-      case 2: return signZoom(vw, vh, false);
+      case 2: return zoomPatch(vw, vh, 0.5 - w / 2 - k * w, 0.4, 0, 1);      // left of the middle, moving outward
       case 3: return [0, 0.1, 0.5, 0.7];
       default: return [0, 0, 1, 1];
     }
   }
+  let trackFrom = 0, trackRest = 0;      // a board that cannot be read is followed for 3 seconds at most, then left alone for 3
   let signStep = 0, signFollow = 0, signTrack = null;   // signFollow: until this time keep looking where a board was found; signTrack: the area around that board
   async function signLook(vw, vh) {
     const { o, reg, lb } = await runNet(S.signModel, signTrack && Date.now() < signFollow ? signTrack : signLookAt(signStep, vw, vh), vw, vh), now = Date.now();
     const found = decodeClasses(o.data, o.dims[2], S.signClasses, reg, lb, 0.3).sort((a, b) => b.w * b.h - a.w * a.h).slice(0, 2);
     S.signBoxes = S.signBoxes.filter(b => now - b.t < 1500);
-    if (found.length) { signFollow = now + 2000; signTrack = trackRegion(found[0], vw, vh); }
-    else { signTrack = null; if (now >= signFollow) signStep++; }
+    if (found.length && now >= trackRest) {
+      if (!trackFrom) trackFrom = now;
+      if (now - trackFrom > 3000) { trackFrom = 0; trackRest = now + 3000; signFollow = 0; signTrack = null; signStep++; }
+      else { signFollow = now + 2000; signTrack = trackRegion(found[0], vw, vh); }
+    } else { signTrack = null; if (now >= signFollow) { signStep++; trackFrom = 0; } }
     S.signReads = S.signReads.filter(r => now - r.t <= 5000);
     for (const d of found) {
       const b = clampBox(d, vw, vh); if (b.w < 16 || b.h < 16) continue;
@@ -850,19 +888,19 @@ if (typeof document !== 'undefined') (function () {
       if (b.value != null) {
         S.signReads.push({ t: now, value: b.value });
         const v = acceptRead(S.signReads, now, b.value, S.signValues[d.cls], S.mapLimit);
-        if (v != null) S.signLimit = { value: v, t: now, map: S.mapLimit };
+        if (v != null) { S.signLimit = { value: v, t: now, map: S.mapLimit }; trackFrom = now; }
       }
       log(b.value != null ? 'Board seen: ' + b.value : 'Board seen, number not read.');
       S.signBoxes.push(b);
     }
   }
 
-  function drawOverlay(vw, vh, open) {
-    if (overlay.width !== vw || overlay.height !== vh) { overlay.width = vw; overlay.height = vh; }
+  function drawOverlay(vw, vh, open, fullH) {
+    if (overlay.width !== vw || overlay.height !== fullH) { overlay.width = vw; overlay.height = fullH; }
     const lw = Math.max(2, vw / 320), now = Date.now();
-    octx.clearRect(0, 0, vw, vh);
+    octx.clearRect(0, 0, vw, fullH);
     for (const b of S.boxes) {
-      const ignored = !open || b.colour === 'none' || b.y + b.h / 2 > vh * 0.62 || Math.max(b.w, b.h) / Math.min(vw, vh) < S.minBox;
+      const ignored = b.colour === 'none' || b.y + b.h / 2 > vh * 0.62 || Math.max(b.w, b.h) / Math.min(vw, vh) < S.minBox;
       octx.lineWidth = ignored ? lw / 2 : lw;
       octx.strokeStyle = ignored ? '#8b96a5' : b.colour === 'red' ? '#ff4d4d' : b.colour === 'yellow' ? '#ffb020' : '#2fd67a';
       octx.strokeRect(b.x, b.y, b.w, b.h);
@@ -875,27 +913,42 @@ if (typeof document !== 'undefined') (function () {
     }
   }
 
-  // One look per turn. Near a signal: traffic light and board looks take turns (two board looks in
-  // three for 2 seconds after a board was found, so it is read again quickly).
-  // Away from signals the red light check is paused, so every look is a board look.
-  let turn = 0;
+  // One look per turn. Near a known signal: traffic light and board looks take turns (two board looks
+  // in three for 2 seconds after a board was found). Away from known signals the red light is still
+  // watched: one look in three, two in three for 3 seconds after a lit signal was seen, and the
+  // alarm needs three sightings. A red seen for 3 seconds there is saved as a signal on this phone.
+  let turn = 0, lightFollow = 0, redSince = 0;
+  function learnSignal() {
+    if (!S.lastFix || S.heading == null || S.test) return;
+    const p = pointAhead(S.lastFix, S.heading, 60);
+    if (S.mapSignals.concat(S.marks).some(m => haversine(p, m) < 150)) return;
+    S.marks.push({ lat: p.lat, lon: p.lon, auto: true });
+    try { localStorage.setItem('ctw-marks', JSON.stringify(S.marks)); } catch (e) {}
+    log('New signal saved here. Saved on this phone: ' + S.marks.length + '.');
+  }
   async function detectLoop() {
     if (!S.running) return;
     let idle = false;
     try {
       if (S.model && S.camera && video.readyState >= 2 && video.videoWidth) {
-        const vw = video.videoWidth, vh = video.videoHeight, open = gateInfo().open, now = Date.now();
+        const vw = video.videoWidth, fullH = video.videoHeight, vh = viewHeight(vw, fullH), open = gateInfo().open, now = Date.now();
         if (frameC.width !== vw || frameC.height !== vh) { frameC.width = vw; frameC.height = vh; }
-        fctx.drawImage(video, 0, 0, vw, vh);                       // freeze one frame for this look
+        fctx.drawImage(video, 0, 0, vw, vh, 0, 0, vw, vh);         // freeze one frame for this look (the searched part)
         turn++;
-        if (S.signReady && (!open || turn % 2 === 0 || (now < signFollow && turn % 3 !== 0))) await signLook(vw, vh);
-        else if (open) await lightLook(vw, vh);
-        else idle = true;
-        if (!open) S.boxes = S.boxes.filter(b => now - b.t < 1500);
+        const follow = now < signFollow;
+        const light = !S.signReady ? true
+          : open ? (follow ? turn % 3 === 0 : turn % 2 === 1)
+          : now < lightFollow ? turn % 3 !== 0 : turn % 3 === 0;
+        if (light) {
+          await lightLook(vw, vh);
+          if (S.hist.length && Date.now() - S.hist[S.hist.length - 1].t < 200) lightFollow = Date.now() + 3000;   // a lit signal was just seen
+        } else await signLook(vw, vh);
         while (S.hist.length && Date.now() - S.hist[0].t > SIGHT_MS) S.hist.shift();
-        S.camLight = open ? smoothLight(S.hist, Date.now()) : 'none';
-        drawOverlay(vw, vh, open);
-        if (turn % 8 === 0 && S.passMs) log('Detector: ' + Math.round(S.passMs) + ' ms per look.' + (S.signReady ? ' Board reader on.' : ''));
+        S.camLight = smoothLight(S.hist, Date.now(), open ? 2 : 3);
+        if (!open && S.camLight === 'red') { if (!redSince) redSince = Date.now(); else if (Date.now() - redSince > 3000) { learnSignal(); redSince = 0; } }
+        else redSince = 0;
+        drawOverlay(vw, vh, open, fullH);
+        if (turn % 8 === 0 && S.passMs) log('Detector: ' + Math.round(S.passMs) + ' ms per look, picture ' + vw + ' x ' + fullH + '.' + (S.signReady ? ' Board reader on.' : ''));
       } else idle = true;
     } catch (e) { log('Detector error: ' + (e.message || e)); idle = true; }
     setTimeout(detectLoop, idle ? 250 : 30);
@@ -961,7 +1014,7 @@ if (typeof document !== 'undefined') (function () {
   $('markBtn').addEventListener('click', () => {
     if (!S.lastFix) { log('No GPS position yet. Press Start and wait for GPS, then mark.'); return; }
     S.marks.push({ lat: S.lastFix.lat, lon: S.lastFix.lon }); saveMarks();
-    log('Signal marked here. Marked by you: ' + S.marks.length + '.'); render();
+    log('Signal marked here. Saved on this phone: ' + S.marks.length + '.'); render();
   });
   $('unmarkBtn').addEventListener('click', () => {
     if (!S.lastFix || !S.marks.length) { log('No marked signal to remove.'); return; }
@@ -971,6 +1024,27 @@ if (typeof document !== 'undefined') (function () {
     S.marks.splice(bi, 1); saveMarks(); log('Removed your mark (' + d + ' m away).'); render();
   });
   $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
+  // Version shown on the page, and a check for a newer one on the site. version.json holds the
+  // newest version; when it differs from this page's, a button offers the update.
+  const APP_VERSION = '2026-11-17 15:30', APP_NOTE = 'Watches for red away from known signals, follows a signal once seen, sharper camera picture, reads boards with phone upright.';
+  $('verInfo').textContent = 'Version: ' + APP_VERSION + '. ' + APP_NOTE;
+  let newVersion = null;
+  async function checkVersion() {
+    try {
+      const v = await (await fetch('version.json?t=' + Date.now(), { cache: 'no-store' })).json();
+      if (v && v.v && v.v !== APP_VERSION) {
+        newVersion = v.v; $('updBtn').classList.remove('hide');
+        $('updBtn').textContent = 'New version ready (' + v.v + '). Tap to update.' + (v.note ? ' ' + v.note : '');
+      }
+    } catch (e) {}
+  }
+  $('updBtn').addEventListener('click', () => { location.href = location.pathname + '?v=' + encodeURIComponent(newVersion || Date.now()); });
+  checkVersion(); setInterval(checkVersion, 5 * 60 * 1000);
+  $('resSel').value = savedRes();
+  $('resSel').addEventListener('change', e => {
+    try { localStorage.setItem(RES_KEY, e.target.value); } catch (err) {}
+    log('Camera detail changed. Press Stop, then Start, to use it.');
+  });
   $('camSel').addEventListener('change', async e => {
     try { localStorage.setItem(CAM_KEY, e.target.value); } catch (err) {}
     if (!S.running || !S.camera) return;
