@@ -42,8 +42,10 @@
   section h2 { font-size: 13px; margin: 0 0 8px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
   .row { display: flex; flex-wrap: wrap; gap: 6px; }
   .row button { flex: 1 0 auto; }
-  label.line { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 8px 0; font-size: 14px; }
+  .line { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 8px 0; font-size: 14px; }
   select, input[type=range] { font: inherit; }
+  #setBtn { width: 100%; margin-top: 8px; }
+  #ttKey[readonly] { color: var(--dim); }
   #ttKey { flex: 1; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 40px; font: inherit; font-size: 16px; }
   select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 40px; }
   input[type=range] { width: 100%; }
@@ -57,7 +59,7 @@
     #stage { grid-column: 1; aspect-ratio: auto !important; height: calc(100vh - 16px); height: calc(100dvh - 16px); }
     #side { grid-column: 2; }
     #banner { margin-top: 0; }
-    main > section, main > .note { grid-column: 1 / -1; }
+    main > section, main > #settingsWrap, main > .note { grid-column: 1 / -1; }
   }
 </style>
 </head>
@@ -81,9 +83,11 @@
   </div>
 
   <button id="startBtn">Start</button>
+  <button id="setBtn">Settings</button>
   <div id="log"></div>
   </div>
 
+  <div id="settingsWrap" class="hide">
   <section>
     <h2>Speed limit</h2>
     <div class="row" id="limitRow">
@@ -93,10 +97,11 @@
       <button data-limit="120">120</button><button data-limit="140">140</button>
     </div>
     <p class="note">Auto reads the limit from the roadside boards with the camera, and uses the map by GPS until a board is read. Tap a number to set it yourself.</p>
-    <label class="line">TomTom key
-      <input id="ttKey" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="paste key here">
-    </label>
-    <p class="note">Optional. With a free TomTom key the limit comes from TomTom's navigation map, which is usually more complete than OpenStreetMap. The key stays on this phone.</p>
+    <div class="line">TomTom key
+      <input id="ttKey" type="text" readonly autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="no key">
+      <button id="ttEdit">Edit</button>
+    </div>
+    <p class="note">With a TomTom key the limit comes from TomTom's navigation map, which is usually more complete than OpenStreetMap. A key is already built in. To change it, tap Edit, put in the new key, then tap Update; the new key is saved on this phone.</p>
   </section>
 
   <section>
@@ -149,6 +154,7 @@
       </div>
     </div>
   </section>
+  </div>
 
   <p class="note">Driver aid only. It can miss or misread lights and limits. Always watch the road yourself and do not touch the phone while driving.</p>
 </main>
@@ -941,11 +947,25 @@ if (typeof document !== 'undefined') (function () {
     try { video.srcObject = await openChosenCamera(); await video.play(); S.hist = []; S.boxes = []; fitStage(); }
     catch (err) { log('Could not switch camera: ' + (err.message || err)); }
   });
-  try { S.ttKey = localStorage.getItem('ctw-ttkey') || ''; } catch (e) {}
-  $('ttKey').value = S.ttKey;
-  $('ttKey').addEventListener('change', e => {
-    S.ttKey = e.target.value.trim(); S.ttError = false; S.lastLookup = null;   // look up again straight away
+  const TT_DEFAULT = 'ub4hvFUVRAohPM2ZwYzMsyeqikzQh8Gr';   // built-in TomTom key; a key typed in the box replaces it on that phone
+  try { S.ttKey = localStorage.getItem('ctw-ttkey') || TT_DEFAULT; } catch (e) { S.ttKey = TT_DEFAULT; }
+  // The key is shown shortened and locked. Edit unlocks it and shows it in full; Update saves it.
+  const maskKey = k => k.length > 10 ? k.slice(0, 4) + ' ... ' + k.slice(-4) : k;
+  function showKey(editing) {
+    const el = $('ttKey'); el.readOnly = !editing; el.value = editing ? S.ttKey : maskKey(S.ttKey);
+    $('ttEdit').textContent = editing ? 'Update' : 'Edit';
+  }
+  showKey(false);
+  $('ttEdit').addEventListener('click', () => {
+    const el = $('ttKey');
+    if (el.readOnly) { showKey(true); el.focus(); return; }
+    S.ttKey = el.value.trim() || TT_DEFAULT; S.ttError = false; S.lastLookup = null;   // look up again straight away
     try { localStorage.setItem('ctw-ttkey', S.ttKey); } catch (err) {}
+    showKey(false); log('TomTom key updated.');
+  });
+  $('setBtn').addEventListener('click', () => {
+    const hidden = $('settingsWrap').classList.toggle('hide');
+    $('setBtn').textContent = hidden ? 'Settings' : 'Close settings';
   });
   function setYellow(on) {
     S.yellowAlarm = on; $('yellowBtn').textContent = on ? 'On' : 'Off'; $('yellowBtn').classList.toggle('on', on);
