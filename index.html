@@ -989,11 +989,39 @@ if (typeof document !== 'undefined') (function () {
     $('stageMsg').classList.remove('hide'); $('stageMsg').textContent = 'Stopped. Press Start to run again.';
     render();
   }
+  // Coming back from another app: the phone stops the camera, GPS and sound of a page that is not on
+  // screen. When the page is shown again they are started again without pressing Stop and Start.
+  // The same check runs every 3 seconds, in case the camera stops for another reason.
+  let reviving = false, lastFrameT = -1, lastFrameAt = 0;
+  async function reviveCamera() {
+    if (!S.running || reviving || document.visibilityState !== 'visible' || !S.camera) return;
+    const st = video.srcObject, track = st && st.getVideoTracks()[0], now = Date.now();
+    if (video.currentTime !== lastFrameT) { lastFrameT = video.currentTime; lastFrameAt = now; }
+    const dead = !track || track.readyState === 'ended', stuck = now - lastFrameAt > 4000;
+    if (!dead && !stuck) return;
+    reviving = true;
+    try {
+      if (!dead) { try { await video.play(); } catch (e) {} }
+      if (dead || video.paused) {
+        if (st) st.getTracks().forEach(t => t.stop());
+        video.srcObject = await openChosenCamera(); await video.play(); fitStage();
+      }
+      S.hist = []; S.boxes = []; S.signBoxes = []; S.signReads = []; lastFrameAt = Date.now();
+      log('Camera started again.');
+    } catch (e) { log('Camera could not start again: ' + (e.message || e) + '. Press Stop, then Start.'); lastFrameAt = Date.now() + 10000; }
+    reviving = false;
+  }
+  setInterval(reviveCamera, 3000);
   document.addEventListener('visibilitychange', async () => {
-    if (S.running && document.visibilityState === 'visible' && navigator.wakeLock) {
-      try { wake = await navigator.wakeLock.request('screen'); } catch (e) {}
-    }
+    if (!S.running || document.visibilityState !== 'visible') return;
+    if (navigator.wakeLock) { try { wake = await navigator.wakeLock.request('screen'); } catch (e) {} }
+    try { if (actx && actx.state !== 'running') await actx.resume(); } catch (e) {}
+    if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; startGps(); }
+    lastFrameAt = Date.now() - 3000;   // give the camera a second to come back by itself, then restart it
+    setTimeout(reviveCamera, 1200);
   });
+  // Sound can stay asleep until the screen is touched once after coming back.
+  document.addEventListener('touchstart', () => { try { if (S.running && actx && actx.state !== 'running') actx.resume(); } catch (e) {} }, { passive: true });
 
   /* ---------- controls ---------- */
   $('startBtn').addEventListener('click', () => S.running ? stop() : start());
@@ -1026,7 +1054,7 @@ if (typeof document !== 'undefined') (function () {
   $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
   // Version shown on the page, and a check for a newer one on the site. version.json holds the
   // newest version; when it differs from this page's, a button offers the update.
-  const APP_VERSION = '2026-11-17 15:30', APP_NOTE = 'Watches for red away from known signals, follows a signal once seen, sharper camera picture, reads boards with phone upright.';
+  const APP_VERSION = '2026-11-17 15:45', APP_NOTE = 'Starts again by itself after you come back from another app. Watches for red away from known signals, follows a signal once seen, sharper camera picture, reads boards with phone upright.';
   $('verInfo').textContent = 'Version: ' + APP_VERSION + '. ' + APP_NOTE;
   let newVersion = null;
   async function checkVersion() {
