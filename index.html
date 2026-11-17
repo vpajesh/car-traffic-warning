@@ -311,6 +311,30 @@ function confirmLimit(reads, now) {
   return null;
 }
 
+// One look at a board is enough when a second, separate source gives the same number: the board
+// detector's own guess (modelValue) or the map's limit for this road. Otherwise two looks must agree.
+function acceptRead(reads, now, value, modelValue, mapLimit) {
+  if (value != null && (value === modelValue || value === mapLimit)) return value;
+  return confirmLimit(reads, now);
+}
+
+// A limit read from a board is used until it is too old, or until the map's limit changes after
+// the board was read (a different road). sign = {value, t, map}; map is the map's limit when the
+// board was read (null if the map had none). Returns the limit to use, or null.
+function boardLimitNow(sign, mapLimit, now, keepMs) {
+  if (!sign || now - sign.t >= keepMs) return null;
+  if (sign.map != null && mapLimit != null && mapLimit !== sign.map) return null;
+  return sign.value;
+}
+
+// The part of the picture to search again after a board was found at box b: an area around the
+// board, at least as large as the detector's picture so the board is not shrunk. Fractions [x, y, w, h].
+function trackRegion(b, vw, vh) {
+  const w = Math.min(vw, Math.max(NET, b.w * 3)), h = Math.min(vh, Math.max(NET, b.h * 3));
+  const x = Math.max(0, Math.min(vw - w, b.x + b.w / 2 - w / 2)), y = Math.max(0, Math.min(vh - h, b.y + b.h / 2 - h / 2));
+  return [x / vw, y / vh, w / vw, h / vh];
+}
+
 // Colour of the lit lamp inside a box the detector called a traffic light.
 // Tuned on night dashcam footage: a real red lamp has a core of strongly saturated red, while shop
 // signs, street lamp glare and reflective road posts are paler. Yellow is accepted only as the
@@ -457,7 +481,7 @@ if (typeof document !== 'undefined') (function () {
     running: false, camera: false, model: null,
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
     hist: [], camLight: 'none', boxes: [], passMs: 0, greenAt: 0,
-    signModel: null, signClasses: [], ocr: null, signReady: false, signReads: [], signLimit: null, signBoxes: [],
+    signModel: null, signClasses: [], signValues: [], ocr: null, signReady: false, signReads: [], signLimit: null, signBoxes: [],
     gate: 'near', mapSignals: [], marks: [], sigAt: null, sigTry: 0, sigBusy: false, sigState: 'not loaded yet',
     manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
     margin: 0, minBox: 0.01, yellowAlarm: true,
@@ -496,8 +520,11 @@ if (typeof document !== 'undefined') (function () {
     if (S.test && S.testLight !== 'camera') return S.testLight;
     return S.camLight;
   }
-  const BOARD_KEEP_MS = 10 * 60 * 1000;   // a board's limit is kept this long unless another board is read
-  const boardLimit = () => S.signLimit && Date.now() - S.signLimit.t < BOARD_KEEP_MS ? S.signLimit.value : null;
+  const BOARD_KEEP_MS = 5 * 60 * 1000;   // a board's limit is kept this long unless another board is read or the map's limit changes
+  function boardLimit() {
+    if (S.signLimit && S.signLimit.map == null && S.mapLimit != null) S.signLimit.map = S.mapLimit;   // map answered after the board was read
+    return boardLimitNow(S.signLimit, S.mapLimit, Date.now(), BOARD_KEEP_MS);
+  }
   function currentLimit() { return S.manualLimit != null ? S.manualLimit : boardLimit() != null ? boardLimit() : S.mapLimit; }
 
   /* ---------- screen ---------- */
@@ -663,6 +690,7 @@ if (typeof document !== 'undefined') (function () {
     try {
       const labels = await (await fetch('models/ctw_labels.json')).json();
       S.signClasses = labels.map((n, i) => /^speed limit/i.test(n) ? i : -1).filter(i => i >= 0);
+      S.signValues = labels.map(n => /^speed limit/i.test(n) ? parseInt(n.replace(/\D/g, ''), 10) : null);   // the detector's own guess of the number
       const buf = await download('models/ctw_signs.onnx', 'Loading board reader');
       S.signModel = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
       log('Loading number reader...');
@@ -804,12 +832,14 @@ if (typeof document !== 'undefined') (function () {
       default: return [0, 0, 1, 1];
     }
   }
-  let signStep = 0, signFollow = 0;      // signFollow: keep looking at the same part until this time, after a board was found there
+  let signStep = 0, signFollow = 0, signTrack = null;   // signFollow: until this time keep looking where a board was found; signTrack: the area around that board
   async function signLook(vw, vh) {
-    const { o, reg, lb } = await runNet(S.signModel, signLookAt(signStep, vw, vh), vw, vh), now = Date.now();
+    const { o, reg, lb } = await runNet(S.signModel, signTrack && Date.now() < signFollow ? signTrack : signLookAt(signStep, vw, vh), vw, vh), now = Date.now();
     const found = decodeClasses(o.data, o.dims[2], S.signClasses, reg, lb, 0.3).sort((a, b) => b.w * b.h - a.w * a.h).slice(0, 2);
     S.signBoxes = S.signBoxes.filter(b => now - b.t < 1500);
-    if (found.length) signFollow = now + 2000; else if (now >= signFollow) signStep++;
+    if (found.length) { signFollow = now + 2000; signTrack = trackRegion(found[0], vw, vh); }
+    else { signTrack = null; if (now >= signFollow) signStep++; }
+    S.signReads = S.signReads.filter(r => now - r.t <= 5000);
     for (const d of found) {
       const b = clampBox(d, vw, vh); if (b.w < 16 || b.h < 16) continue;
       const px = fctx.getImageData(b.x, b.y, b.w, b.h).data; b.t = now; b.value = null;
@@ -817,13 +847,14 @@ if (typeof document !== 'undefined') (function () {
         const c = signCrop(px, b.w, b.h, { x: 0, y: 0, w: b.w, h: b.h }, part); if (!c) break;
         b.value = parseLimit(await readNumber(c)); if (b.value != null) break;
       }
-      if (b.value != null) S.signReads.push({ t: now, value: b.value });
+      if (b.value != null) {
+        S.signReads.push({ t: now, value: b.value });
+        const v = acceptRead(S.signReads, now, b.value, S.signValues[d.cls], S.mapLimit);
+        if (v != null) S.signLimit = { value: v, t: now, map: S.mapLimit };
+      }
       log(b.value != null ? 'Board seen: ' + b.value : 'Board seen, number not read.');
       S.signBoxes.push(b);
     }
-    S.signReads = S.signReads.filter(r => now - r.t <= 5000);
-    const v = confirmLimit(S.signReads, now);
-    if (v != null) S.signLimit = { value: v, t: now };
   }
 
   function drawOverlay(vw, vh, open) {
