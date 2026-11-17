@@ -383,21 +383,32 @@ function lampColour(data, w, h) {
 
 // The light that counts: the biggest lit box that is not too small and not down at road level
 // (reflective road posts and the car bonnet sit in the bottom part of the picture).
-function pickLight(boxes, frameH, minBox, frameW) {
+function pickLightBox(boxes, frameH, minBox, frameW) {
   const side = Math.min(frameH, frameW || frameH);   // size is judged against the short side, so an upright phone is not penalised
   let best = null;
   for (const b of boxes) {
     if (b.colour === 'none' || b.y + b.h / 2 > frameH * 0.62 || Math.max(b.w, b.h) / side < minBox) continue;
     if (!best || b.w * b.h > best.w * best.h) best = b;
   }
-  return best ? best.colour : 'none';
+  return best;
 }
+function pickLight(boxes, frameH, minBox, frameW) { const b = pickLightBox(boxes, frameH, minBox, frameW); return b ? b.colour : 'none'; }
 
 // Just after driving through on green, red lights for the other roads of the junction come into
 // view. For a few seconds after the last green sighting, red and yellow are not counted.
+// The exception is the signal ahead itself changing from green to yellow or red: that is the moment
+// the alarm matters most. `changed` is true when the red or yellow lamp sits where a green one was
+// seen a moment ago and no green is in view any more (see signalChanged); then it is counted at once.
 const GREEN_GRACE_MS = 5000;
-function afterGreen(colour, msSinceGreen) {
-  return (colour === 'red' || colour === 'yellow') && msSinceGreen < GREEN_GRACE_MS ? 'none' : colour;
+function afterGreen(colour, msSinceGreen, changed) {
+  return (colour === 'red' || colour === 'yellow') && msSinceGreen < GREEN_GRACE_MS && !changed ? 'none' : colour;
+}
+// box: the red/yellow lamp picked now. greens: green lamps seen lately [{x, y, w, h, t}].
+// True when a green was at this place within the last 2.5 s and none has been seen for 0.8 s.
+function signalChanged(box, greens, now) {
+  if (!box || greens.some(g => now - g.t < 800)) return false;
+  const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+  return greens.some(g => now - g.t <= 2500 && Math.hypot(g.x + g.w / 2 - cx, g.y + g.h / 2 - cy) < 2 * Math.max(box.h, g.h, box.w, g.w));
 }
 
 // Is the car close to a known traffic signal that lies ahead? signals: [{lat, lon}].
@@ -542,7 +553,7 @@ if (typeof document !== 'undefined') (function () {
   const S = {
     running: false, camera: false, model: null,
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
-    hist: [], camLight: 'none', boxes: [], passMs: 0, greenAt: 0,
+    hist: [], camLight: 'none', boxes: [], passMs: 0, greenAt: 0, greens: [],
     signModel: null, signClasses: [], signValues: [], ocr: null, signReady: false, signReads: [], signLimit: null, signBoxes: [],
     gate: 'near', mapSignals: [], marks: [], sigAt: null, sigTry: 0, sigBusy: false, sigState: 'not loaded yet',
     manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
@@ -893,9 +904,10 @@ if (typeof document !== 'undefined') (function () {
       lightTrack = trackRegion(cand, vw, vh); lightTrackUntil = now + 2500;
       if (cand.colour !== 'none') { const y = (cand.y + cand.h / 2) / vh; tlY = tlY == null ? y : tlY * 0.8 + y * 0.2; try { localStorage.setItem('ctw-tly', tlY.toFixed(3)); } catch (e) {} }
     }
-    const seen = pickLight(S.boxes, vh, S.minBox, vw);
+    const best = pickLightBox(S.boxes, vh, S.minBox, vw), seen = best ? best.colour : 'none';
     if (seen === 'green') S.greenAt = now;
-    const colour = afterGreen(seen, now - S.greenAt);
+    S.greens = S.greens.filter(g => now - g.t <= 2500).concat(found.filter(b => b.colour === 'green'));
+    const colour = afterGreen(seen, now - S.greenAt, signalChanged(best, S.greens, now));
     if (colour !== 'none') S.hist.push({ t: now, colour });
   }
 
@@ -983,9 +995,9 @@ if (typeof document !== 'undefined') (function () {
         fctx.drawImage(video, 0, 0, vw, vh, 0, 0, vw, vh);         // freeze one frame for this look (the searched part)
         turn++;
         const follow = now < signFollow;
-        const light = !S.signReady ? true
-          : open ? (follow ? turn % 3 === 0 : turn % 2 === 1)
-          : now < lightFollow ? turn % 3 !== 0 : turn % 3 === 0;
+        // The speed limit now comes from the map first, so most looks go to traffic lights: three in
+        // four near a known signal, two in three elsewhere; every second look while a board is being read.
+        const light = !S.signReady ? true : follow ? turn % 2 === 1 : open ? turn % 4 !== 0 : turn % 3 !== 0;
         if (light) {
           await lightLook(vw, vh);
           if (S.hist.length && Date.now() - S.hist[S.hist.length - 1].t < 200) lightFollow = Date.now() + 3000;   // a lit signal was just seen
@@ -1031,7 +1043,7 @@ if (typeof document !== 'undefined') (function () {
   function stop() {
     S.running = false; $('startBtn').textContent = 'Start'; $('startBtn').classList.remove('stop');
     clearInterval(renderTimer); if (watchId != null) navigator.geolocation.clearWatch(watchId); watchId = null;
-    stopCamera(); S.hist = []; S.boxes = []; S.signBoxes = []; S.signReads = []; S.greenAt = 0; S.camLight = 'none'; S.gpsSpeed = null;
+    stopCamera(); S.hist = []; S.boxes = []; S.signBoxes = []; S.signReads = []; S.greenAt = 0; S.greens = []; S.camLight = 'none'; S.gpsSpeed = null;
     if (wake) { try { wake.release(); } catch (e) {} wake = null; }
     $('stageMsg').classList.remove('hide'); $('stageMsg').textContent = 'Stopped. Press Start to run again.';
     render();
@@ -1101,7 +1113,7 @@ if (typeof document !== 'undefined') (function () {
   $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
   // Version shown on the page, and a check for a newer one on the site. version.json holds the
   // newest version; when it differs from this page's, a button offers the update.
-  const APP_VERSION = '2026-11-17 20:20', APP_NOTE = 'Speed limit: TomTom map first, boards where the map has no answer; no longer gets stuck on a weak network.';
+  const APP_VERSION = '2026-11-17 21:50', APP_NOTE = 'Alarm at once when the signal ahead turns from green to yellow or red (it used to wait 5 seconds).';
   $('verInfo').textContent = 'Version: ' + APP_VERSION + '. ' + APP_NOTE;
   let newVersion = null;
   async function checkVersion() {

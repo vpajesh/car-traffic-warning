@@ -1,1 +1,1 @@
-{"v": "2026-11-17 20:20", "note": "Speed limit: TomTom map first, boards where the map has no answer; no longer gets stuck on a weak network."}
+{"v": "2026-11-17 21:50", "note": "Alarm at once when the signal ahead turns from green to yellow or red (it used to wait 5 seconds)."}
