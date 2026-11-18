@@ -122,6 +122,9 @@
 
   <section>
     <h2>Settings</h2>
+    <label class="line">Alarm sound
+      <select id="soundSel"><option value="soft">Soft</option><option value="sharp">Sharp</option></select>
+    </label>
     <label class="line">Speed alarm margin
       <select id="marginSel">
         <option value="0" selected>0 km/h over</option><option value="5">5 km/h over</option>
@@ -315,6 +318,15 @@ function confirmLimit(reads, now) {
   const recent = reads.filter(r => now - r.t <= 5000);
   for (let i = recent.length - 1; i > 0; i--) for (let k = i - 1; k >= 0; k--) if (recent[i].value === recent[k].value) return recent[i].value;
   return null;
+}
+
+// Before the over-speed alarm sounds on a limit that came from the map, the map is asked again at
+// the car's present place: on joining a faster road the old road's limit would otherwise beep until
+// the next answer. overSince: when the speed first went over the limit. mapAt: when the map last
+// answered. The alarm waits for an answer newer than overSince, but never longer than 6 seconds.
+function speedAlarmReady(src, overSince, mapAt, now) {
+  if (src !== 'map' || !overSince) return true;
+  return mapAt >= overSince || now - overSince >= 6000;
 }
 
 // Which limit to use. Order: set by the driver; TomTom's navigation map while its answer is fresh
@@ -563,7 +575,7 @@ if (typeof document !== 'undefined') (function () {
     hist: [], camLight: 'none', boxes: [], passMs: 0, greenAt: 0, greens: [],
     signModel: null, signClasses: [], signValues: [], ocr: null, signReady: false, signReads: [], signLimit: null, signBoxes: [],
     gate: 'near', mapSignals: [], marks: [], sigAt: null, sigTry: 0, sigBusy: false, sigState: 'not loaded yet',
-    manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, lookupBusy: false,
+    manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, overSince: 0, underAt: 0, noLimit: 0, lookupBusy: false,
     margin: 0, minBox: 0.01, yellowAlarm: true,
     test: false, testSpeed: 0, testLight: 'camera',
   };
@@ -572,22 +584,30 @@ if (typeof document !== 'undefined') (function () {
 
   /* ---------- sound ---------- */
   let actx = null, beepTimer = null, beepKind = null;
+  // Two alarm sounds. Soft (default): a rounded tone that fades in and out, with no click.
+  // Sharp: the hard-edged beep, which cuts through road noise better.
+  let soundKind = 'soft'; try { if (localStorage.getItem('ctw-sound') === 'sharp') soundKind = 'sharp'; } catch (e) {}
   function beep(freq, dur, type) {
     if (!actx) return;
-    const o = actx.createOscillator(), g = actx.createGain();
-    o.type = type || 'square'; o.frequency.value = freq; g.gain.value = 0.9;   // full volume; the phone's media volume sets the real loudness
-    o.connect(g); g.connect(actx.destination);
-    o.start(); o.stop(actx.currentTime + dur);
+    const t = actx.currentTime, g = actx.createGain(); g.connect(actx.destination);
+    const osc = (f, kind, vol) => { const o = actx.createOscillator(), v = actx.createGain(); o.type = kind; o.frequency.value = f; v.gain.value = vol; o.connect(v); v.connect(g); o.start(t); o.stop(t + dur + 0.05); };
+    if (soundKind === 'sharp') { g.gain.value = 0.9; osc(freq, type || 'square', 1); return; }   // full volume; the phone's media volume sets the real loudness
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.9, t + 0.02);         // fade in 20 ms
+    g.gain.setValueAtTime(0.9, t + dur * 0.45); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);   // fade out
+    osc(freq, 'sine', 0.8); osc(freq * 2, 'sine', 0.15); osc(freq * 3, 'sine', 0.05);            // a little brightness so it is still heard in the car
   }
   function setAlarm(kind) {
     if (kind === beepKind) return;
     beepKind = kind; clearInterval(beepTimer); beepTimer = null;
     if (!kind) return;
     if (actx && actx.state === 'suspended') actx.resume();   // sound can go to sleep; wake it for the alarm
+    const soft = soundKind !== 'sharp';
     const fn = kind === 'red'
-      ? () => { beep(980, 0.14, 'square'); if (navigator.vibrate) navigator.vibrate(120); }
-      : () => { beep(620, 0.16, 'square'); setTimeout(() => beep(820, 0.16, 'square'), 200); if (navigator.vibrate) navigator.vibrate(80); };
-    fn(); beepTimer = setInterval(fn, kind === 'red' ? 280 : 600);
+      ? (soft ? () => { beep(880, 0.26); if (navigator.vibrate) navigator.vibrate(120); }
+              : () => { beep(980, 0.14, 'square'); if (navigator.vibrate) navigator.vibrate(120); })
+      : (soft ? () => { beep(660, 0.3); setTimeout(() => beep(520, 0.36), 300); if (navigator.vibrate) navigator.vibrate(80); }
+              : () => { beep(620, 0.16, 'square'); setTimeout(() => beep(820, 0.16, 'square'), 200); if (navigator.vibrate) navigator.vibrate(80); });
+    fn(); beepTimer = setInterval(fn, kind === 'red' ? (soft ? 420 : 280) : (soft ? 1100 : 600));
   }
 
   /* ---------- current values ---------- */
@@ -631,11 +651,19 @@ if (typeof document !== 'undefined') (function () {
 
     const b = $('banner');
     if (!S.running) { b.className = ''; b.textContent = 'Not running'; setAlarm(null); return; }
-    const alarm = decide({ speed, light, limit, margin: S.margin, yellowAlarm: S.yellowAlarm });
+    let alarm = decide({ speed, light, limit, margin: S.margin, yellowAlarm: S.yellowAlarm });
+    if (alarm === 'speed') {
+      if (!S.overSince) S.overSince = Date.now();
+      if (!S.test && !speedAlarmReady(limitNow().src, S.overSince, S.mapAt || 0, Date.now())) alarm = 'check';   // ask the map again first
+      S.underAt = 0;
+    } else if (S.overSince) {            // a short dip under the limit does not start the check again
+      if (!S.underAt) S.underAt = Date.now(); else if (Date.now() - S.underAt > 3000) { S.overSince = 0; S.underAt = 0; }
+    }
     if (alarm === 'red') { b.className = 'red'; b.textContent = (light === 'red' ? 'RED' : 'YELLOW') + ' LIGHT - STOP'; }
     else if (alarm === 'speed') { b.className = 'speed'; b.textContent = 'SLOW DOWN - LIMIT ' + limit; }
+    else if (alarm === 'check') { b.className = 'ok'; b.textContent = 'Checking limit...'; }
     else { b.className = 'ok'; b.textContent = speed != null && speed < STOP_KMH ? 'Stopped' : 'OK'; }
-    setAlarm(alarm);
+    setAlarm(alarm === 'check' ? null : alarm);
   }
 
   /* ---------- GPS ---------- */
@@ -683,12 +711,19 @@ if (typeof document !== 'undefined') (function () {
   /* ---------- speed limit from map ---------- */
   async function maybeLookup(fix) {
     if (S.lookupBusy) return;
-    if (S.lastLookup && (fix.t - S.lastLookup.t < 5000 || (haversine(S.lastLookup, fix) < 80 && fix.t - S.lastLookup.t < 15000))) return;   // at most one question every 5 s
+    // Normally at most one question every 5 s. When the speed has just gone over the limit and the
+    // map has not answered since, ask at once (1.5 s apart at most).
+    const urgent = S.overSince && (S.mapAt || 0) < S.overSince;
+    if (S.lastLookup && !(urgent && fix.t - S.lastLookup.t >= 1500) &&
+        (fix.t - S.lastLookup.t < 5000 || (haversine(S.lastLookup, fix) < 80 && fix.t - S.lastLookup.t < 15000))) return;
     S.lookupBusy = true; S.lastLookup = fix;
+    const asked = Date.now();
     let found = false, tomtomDown = false;
     if (S.ttKey) {                                   // 1) TomTom navigation map, if a key is set
       try {
-        const u = 'https://api.tomtom.com/search/2/reverseGeocode/' + fix.lat.toFixed(6) + ',' + fix.lon.toFixed(6) +
+        // Ask about the place the car will be in about 1.5 s (GPS and the answer both lag), so a new road is noticed sooner.
+        const v = S.gpsSpeed || 0, at = S.heading != null && v > 20 ? pointAhead(fix, S.heading, Math.min(50, v / 3.6 * 1.5)) : fix;
+        const u = 'https://api.tomtom.com/search/2/reverseGeocode/' + at.lat.toFixed(6) + ',' + at.lon.toFixed(6) +
           '.json?key=' + encodeURIComponent(S.ttKey) + '&returnSpeedLimit=true&radius=40' +
           (S.heading != null ? '&heading=' + S.heading.toFixed(1) : '');
         const ac = new AbortController(), timer = setTimeout(() => ac.abort(), 4000);   // give up after 4 s, so a weak network cannot hold the next question
@@ -698,20 +733,27 @@ if (typeof document !== 'undefined') (function () {
           const a = (((await r.json()).addresses || [])[0] || {}).address || {};
           const limit = parseTomTomLimit(a.speedLimit);
           if (limit != null) {
-            S.mapLimit = limit; S.mapSrc = 'TomTom'; S.mapAt = Date.now();
+            S.mapLimit = limit; S.mapSrc = 'TomTom'; S.mapAt = Date.now(); S.noLimit = 0;
             S.mapRoad = (a.routeNumbers && a.routeNumbers[0]) || a.streetName || a.street || 'road';
             found = true;
-          }
+          } else if (++S.noLimit >= 2 && S.mapSrc === 'TomTom') { S.mapLimit = null; S.mapRoad = null; S.mapAt = Date.now(); }   // this road has no limit in TomTom: the last road's limit no longer applies
         } else if (!S.ttError) tomtomDown = true;       // busy or over the day's allowance: keep the last answer
       } catch (e) { tomtomDown = true; }                // no network or too slow: keep the last answer, ask again soon
     }
-    if (!found && !tomtomDown) try {                  // 2) OpenStreetMap, when TomTom has no key or no limit for this road
-      const q = '[out:json][timeout:8];way(around:40,' + fix.lat.toFixed(6) + ',' + fix.lon.toFixed(6) +
-        ')[highway];out tags geom;';
-      const m = matchRoad((await askMap(q)).elements, fix, S.heading);
-      S.mapLimit = m ? m.limit : null; S.mapRoad = m ? m.road : null; S.mapSrc = 'map'; S.mapAt = Date.now();
-    } catch (e) { /* offline or servers busy: keep last value */ }
     S.lookupBusy = false;
+    // 2) OpenStreetMap, when TomTom has no key or no limit for this road. It can be slow, so it runs
+    // on the side and never holds up the next TomTom question; a newer TomTom answer wins.
+    if (!found && !tomtomDown && !S.osmBusy) {
+      S.osmBusy = true;
+      (async () => {
+        try {
+          const q = '[out:json][timeout:8];way(around:40,' + fix.lat.toFixed(6) + ',' + fix.lon.toFixed(6) + ')[highway];out tags geom;';
+          const m = matchRoad((await askMap(q)).elements, fix, S.heading);
+          if (!(S.mapSrc === 'TomTom' && S.mapLimit != null && S.mapAt > asked)) { S.mapLimit = m ? m.limit : null; S.mapRoad = m ? m.road : null; S.mapSrc = 'map'; S.mapAt = Date.now(); }
+        } catch (e) { /* offline or servers busy: keep last value */ }
+        S.osmBusy = false;
+      })();
+    }
   }
 
   /* ---------- known traffic signals (map + marked by the driver) ---------- */
@@ -1109,6 +1151,11 @@ if (typeof document !== 'undefined') (function () {
     for (const b of $('limitRow').children) b.classList.toggle('on', b === e.target);
     render();
   });
+  $('soundSel').value = soundKind;
+  $('soundSel').addEventListener('change', e => {
+    soundKind = e.target.value; try { localStorage.setItem('ctw-sound', soundKind); } catch (err) {}
+    if (actx) { beep(880, 0.26, 'square'); setTimeout(() => beep(660, 0.3, 'square'), 450); }   // play it once so the choice can be heard
+  });
   $('marginSel').addEventListener('change', e => { S.margin = Number(e.target.value); try { localStorage.setItem('ctw-margin', String(S.margin)); } catch (err) {} });
   try { const m = localStorage.getItem('ctw-margin'); if (m != null && ['0', '5', '10', '20'].includes(m)) { S.margin = Number(m); $('marginSel').value = m; } } catch (e) {}
   $('gateSel').value = S.gate;
@@ -1132,7 +1179,7 @@ if (typeof document !== 'undefined') (function () {
   $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
   // Version shown on the page, and a check for a newer one on the site. version.json holds the
   // newest version; when it differs from this page's, a button offers the update.
-  const APP_VERSION = '2026-11-18 09:45', APP_NOTE = 'Aim guide on the camera picture: put the far end of the road on the yellow line. Phone upright: signals are found lower in the picture too.';
+  const APP_VERSION = '2026-11-18 18:40', APP_NOTE = 'Softer alarm sound (Settings: Alarm sound). Speed alarm asks the map again before beeping, so joining a faster road does not beep on the old limit.';
   $('verInfo').textContent = 'Version: ' + APP_VERSION + '. ' + APP_NOTE;
   let newVersion = null;
   async function checkVersion() {
