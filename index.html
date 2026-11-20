@@ -452,11 +452,11 @@ function nearSignal(pos, heading, signals, radius) {
   return { near, nearest, count: signals.length };
 }
 
-// The part of the camera picture that is searched. A phone held upright sees the road only in the
-// top part and the dashboard below, so only the top 65% is used. Returns the height to use.
+// The part of the camera picture that is searched: the box drawn on the screen, from the top of the
+// picture down to a little below the aim line. Nothing below it is looked at. Returns its height.
 // a: where the driver has put the aim line, as a share of the picture height (null = not moved).
 function aimFrac(vw, fullH, a) { return a != null ? a : fullH > vw * 1.2 ? 0.45 : 0.5; }
-function viewHeight(vw, vh, a) { return vh > vw * 1.2 ? Math.round(vh * Math.min(1, aimFrac(vw, vh, a) + 0.2)) : vh; }
+function viewHeight(vw, vh, a) { return Math.round(vh * Math.min(1, aimFrac(vw, vh, a) + (vh > vw * 1.2 ? 0.13 : 0.12))); }   // = lightMaxY: only the box is searched
 // Lamps lower in the picture than this are not signals (brake lights, reflections on the bonnet).
 // Depends on how the phone is aimed, so it is kept generous: with the phone upright the horizon
 // has been seen anywhere from 10% to 50% of the way down.
@@ -940,7 +940,10 @@ if (typeof document !== 'undefined') (function () {
   // One part is searched per look, the centre most often.
   // Zoomed look for far lights: a patch of the picture at full sharpness (not shrunk), up the road
   // ahead. A far light is only a few pixels once a big area is shrunk to the detector's size.
-  const WIDE_LOOKS = [[0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0, 0.1, 0.4, 0.6], [0.3, 0.1, 0.4, 0.6], [0, 0, 1, 1], [0.6, 0.1, 0.4, 0.6]];
+  // Wide looks, as shares of the box. Phone on its side: centre, whole box, left, centre, whole box, right.
+  // Phone upright (narrow box): whole box, lower left, whole box, lower right.
+  const WIDE_SIDE = [[0.3, 0.15, 0.4, 0.85], [0, 0, 1, 1], [0, 0.15, 0.4, 0.85], [0.3, 0.15, 0.4, 0.85], [0, 0, 1, 1], [0.6, 0.15, 0.4, 0.85]];
+  const WIDE_UP = [[0, 0, 1, 1], [0, 0.35, 0.6, 0.65], [0, 0, 1, 1], [0.4, 0.35, 0.6, 0.65]];
   // Every third look is a zoomed one (the patches across the middle of the road in turn); the others
   // go round the wide looks.
   let tlY = null;      // where signals have been seen, as a share of the picture height (kept between drives)
@@ -949,7 +952,7 @@ if (typeof document !== 'undefined') (function () {
     const grid = zoomGrid(vw, vh, aimPx), many = grid.length * grid[0].length > 1;
     // one patch: every third look is zoomed. Several patches (4K): two looks in three are zoomed.
     const zoomed = many ? step % 3 !== 0 : step % 3 === 0;
-    if (!zoomed) { const w = many ? Math.floor(step / 3) : step - Math.floor(step / 3) - 1; return WIDE_LOOKS[w % WIDE_LOOKS.length]; }
+    if (!zoomed) { const w = many ? Math.floor(step / 3) : step - Math.floor(step / 3) - 1; const looks = vh > vw ? WIDE_UP : WIDE_SIDE; return looks[w % looks.length]; }
     const z = many ? step - Math.floor(step / 3) - 1 : step / 3;
     const fav = Math.max(0, tlY == null ? 0 : grid.findIndex(row => tlY >= row[0][1] && tlY <= row[0][1] + row[0][3]));   // row on the aim line unless signals have been seen higher
     return zoomPick(grid, z, fav);
@@ -999,9 +1002,9 @@ if (typeof document !== 'undefined') (function () {
     const n = zoomCount(vw, 0.3), k = Math.floor(step / SIGN_STEPS) % n, w = Math.min(1, NET / vw);
     switch (step % SIGN_STEPS) {
       case 0: return zoomPatch(vw, vh, 0.5 + w / 2 + k * w, 0.4, 0, 1);      // right of the middle, moving outward
-      case 1: return [0.5, 0.1, 0.5, 0.7];
+      case 1: return vh > vw ? [0.4, 0.35, 0.6, 0.65] : [0.5, 0.15, 0.5, 0.85];
       case 2: return zoomPatch(vw, vh, 0.5 - w / 2 - k * w, 0.4, 0, 1);      // left of the middle, moving outward
-      case 3: return [0, 0.1, 0.5, 0.7];
+      case 3: return vh > vw ? [0, 0.35, 0.6, 0.65] : [0, 0.15, 0.5, 0.85];
       default: return [0, 0, 1, 1];
     }
   }
@@ -1043,11 +1046,11 @@ if (typeof document !== 'undefined') (function () {
     // the road should sit. The phone is aimed so that the road's far end touches the line.
     const ay = aimPx, gx = vw * 0.04, gy = fullH * 0.04, fs = Math.round(Math.min(vw, fullH) / 28);
     octx.save(); octx.setLineDash([lw * 5, lw * 4]); octx.lineWidth = lw; octx.strokeStyle = 'rgba(255,255,255,0.75)';
-    octx.strokeRect(gx, gy, vw - 2 * gx, maxLightY - gy);
+    octx.strokeRect(lw, lw, vw - 2 * lw, maxLightY - lw);
     octx.setLineDash([]); octx.strokeStyle = 'rgba(255,214,10,0.9)'; octx.beginPath(); octx.moveTo(gx, ay); octx.lineTo(vw - gx, ay); octx.stroke();
     octx.font = '600 ' + fs + 'px system-ui, sans-serif'; octx.fillStyle = 'rgba(255,214,10,0.95)'; octx.textBaseline = 'bottom';
     octx.fillText('Far end of road here', gx + lw * 3, ay - lw * 2);
-    octx.fillStyle = 'rgba(255,255,255,0.85)'; octx.textBaseline = 'top'; octx.fillText('Signals inside this box', gx + lw * 3, gy + lw * 3);
+    octx.fillStyle = 'rgba(255,255,255,0.85)'; octx.textBaseline = 'top'; octx.fillText('Only this box is searched', gx + lw * 3, gy + lw * 3);
     octx.restore();
     for (const b of S.boxes) {
       const ignored = b.colour === 'none' || b.y + b.h / 2 > maxLightY || Math.max(b.w, b.h) / Math.min(vw, vh) < S.minBox;
@@ -1249,7 +1252,7 @@ if (typeof document !== 'undefined') (function () {
   $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
   // Version shown on the page, and a check for a newer one on the site. version.json holds the
   // newest version; when it differs from this page's, a button offers the update.
-  const APP_VERSION = '2026-11-20 08:55', APP_NOTE = 'Drag the round handle on the camera picture to move the yellow aim line. Lamps on vehicles (brake lights) are no longer taken as signals.';
+  const APP_VERSION = '2026-11-20 09:20', APP_NOTE = 'Only the box on the camera picture is searched now. Drag the round handle to move the aim line and the box.';
   $('verInfo').textContent = 'Version: ' + APP_VERSION + '. ' + APP_NOTE;
   let newVersion = null;
   async function checkVersion() {
