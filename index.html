@@ -17,9 +17,11 @@
   #stage { position: relative; background: #000; border-radius: 12px; overflow: hidden;
     aspect-ratio: 4 / 3; border: 1px solid var(--line); }
   #stage video, #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
-  #aimGrip { position: absolute; right: 4px; width: 52px; height: 52px; margin-top: -26px; border-radius: 50%; z-index: 3; display: flex; align-items: center; justify-content: center;
+  #topGrip { left: 4px; color: #fff !important; border-color: rgba(255,255,255,0.85) !important; }
+  #aimGrip { right: 4px; }
+  .grip { position: absolute; width: 52px; height: 52px; margin-top: -26px; border-radius: 50%; z-index: 3; display: flex; align-items: center; justify-content: center;
     background: rgba(0,0,0,0.6); color: #ffd60a; border: 2px solid rgba(255,214,10,0.85); font-size: 26px; touch-action: none; user-select: none; -webkit-user-select: none; cursor: ns-resize; }
-  #aimGrip.hide { display: none; }
+  .grip.hide { display: none; }
   #stageMsg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     text-align: center; padding: 20px; color: var(--dim); font-size: 14px; }
   #banner { margin: 10px 0; border-radius: 12px; padding: 14px; text-align: center;
@@ -73,7 +75,8 @@
   <div id="stage">
     <video id="video" playsinline muted autoplay></video>
     <canvas id="overlay"></canvas>
-    <div id="aimGrip" class="hide" role="slider" aria-label="Drag to move the aim line">&#8597;</div>
+    <div id="aimGrip" class="hide grip" role="slider" aria-label="Drag to move the aim line">&#8597;</div>
+    <div id="topGrip" class="hide grip" role="slider" aria-label="Drag to move the top of the box">&#8597;</div>
     <div id="stageMsg">Mount the phone so the rear camera faces the road, then press Start.</div>
   </div>
 
@@ -461,6 +464,9 @@ function viewHeight(vw, vh, a) { return Math.round(vh * Math.min(1, aimFrac(vw, 
 // Depends on how the phone is aimed, so it is kept generous: with the phone upright the horizon
 // has been seen anywhere from 10% to 50% of the way down.
 // Where the far end of the road should sit in the picture: the aim line drawn on the screen.
+// Top edge of the box, as a share of the picture height. The driver can lower it to keep lights on
+// buildings out; it always stays at least a tenth of the picture above the aim line.
+function boxTopFrac(vw, fullH, a, top) { return Math.max(0, Math.min(top || 0, aimFrac(vw, fullH, a) - 0.1)); }
 function aimY(vw, fullH, a) { return fullH * aimFrac(vw, fullH, a); }
 function lightMaxY(vw, fullH, a) { return fullH * Math.min(1, aimFrac(vw, fullH, a) + (fullH > vw * 1.2 ? 0.13 : 0.12)); }
 
@@ -909,7 +915,7 @@ if (typeof document !== 'undefined') (function () {
   async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('no camera access');
     video.srcObject = await openChosenCamera(); await video.play();
-    S.camera = true; $('stageMsg').classList.add('hide'); $('aimGrip').classList.remove('hide');
+    S.camera = true; $('stageMsg').classList.add('hide'); $('aimGrip').classList.remove('hide'); $('topGrip').classList.remove('hide');
     fitStage();
   }
   function fitStage() {
@@ -1044,14 +1050,17 @@ if (typeof document !== 'undefined') (function () {
     octx.clearRect(0, 0, vw, fullH);
     // Aim guide: the dashed box is where signals are looked for; the line is where the far end of
     // the road should sit. The phone is aimed so that the road's far end touches the line.
-    const ay = aimPx, gx = vw * 0.04, gy = fullH * 0.04, fs = Math.round(Math.min(vw, fullH) / 28);
-    octx.save(); octx.setLineDash([lw * 5, lw * 4]); octx.lineWidth = lw; octx.strokeStyle = 'rgba(255,255,255,0.75)';
-    octx.strokeRect(lw, lw, vw - 2 * lw, maxLightY - lw);
+    const ay = aimPx + boxTop, gx = vw * 0.04, gy = boxTop, fs = Math.round(Math.min(vw, fullH) / 28);
+    octx.save();
+    octx.lineWidth = lw * 2; octx.strokeStyle = 'rgba(0,0,0,0.55)'; octx.strokeRect(lw, boxTop + lw, vw - 2 * lw, maxLightY - lw);   // dark line under the white one, so it shows against a bright sky
+    octx.setLineDash([lw * 5, lw * 4]); octx.lineWidth = lw; octx.strokeStyle = 'rgba(255,255,255,0.95)';
+    octx.strokeRect(lw, boxTop + lw, vw - 2 * lw, maxLightY - lw);
     octx.setLineDash([]); octx.strokeStyle = 'rgba(255,214,10,0.9)'; octx.beginPath(); octx.moveTo(gx, ay); octx.lineTo(vw - gx, ay); octx.stroke();
     octx.font = '600 ' + fs + 'px system-ui, sans-serif'; octx.fillStyle = 'rgba(255,214,10,0.95)'; octx.textBaseline = 'bottom';
     octx.fillText('Far end of road here', gx + lw * 3, ay - lw * 2);
     octx.fillStyle = 'rgba(255,255,255,0.85)'; octx.textBaseline = 'top'; octx.fillText('Only this box is searched', gx + lw * 3, gy + lw * 3);
     octx.restore();
+    octx.save(); octx.translate(0, boxTop);            // boxes are kept in the searched part's own coordinates
     for (const b of S.boxes) {
       const ignored = b.colour === 'none' || b.y + b.h / 2 > maxLightY || Math.max(b.w, b.h) / Math.min(vw, vh) < S.minBox;
       octx.lineWidth = ignored ? lw / 2 : lw;
@@ -1064,13 +1073,24 @@ if (typeof document !== 'undefined') (function () {
       octx.strokeRect(b.x, b.y, b.w, b.h);
       if (b.value != null) octx.fillText(String(b.value), b.x, Math.max(vw / 40, b.y - lw * 2));
     }
+    octx.restore();
   }
 
   // One look per turn. Near a known signal: traffic light and board looks take turns (two board looks
   // in three for 2 seconds after a board was found). Away from known signals the red light is still
   // watched: one look in three, two in three for 3 seconds after a lit signal was seen, and the
   // alarm needs three sightings. A red seen for 3 seconds there is saved as a signal on this phone.
-  let turn = 0, lightFollow = 0, redSince = 0, maxLightY = 0, aimPx = 0;
+  // The searched part of the picture is the box: rows boxTop .. boxTop + maxLightY. Inside the code
+  // positions are counted from the box's own top: maxLightY is its height, aimPx the aim line in it.
+  let turn = 0, lightFollow = 0, redSince = 0, maxLightY = 0, aimPx = 0, boxTop = 0;
+  const topSet = { p: 0, l: 0 };
+  try { for (const k of ['p', 'l']) { const v = parseFloat(localStorage.getItem('ctw-top-' + k)); if (v > 0 && v <= 0.7) topSet[k] = v; } } catch (e) {}
+  function setGeometry(vw, fullH) {
+    const k = aimKey(), a = aimSet[k];
+    boxTop = Math.round(fullH * boxTopFrac(vw, fullH, a, topSet[k]));
+    maxLightY = Math.round(lightMaxY(vw, fullH, a)) - boxTop; aimPx = aimY(vw, fullH, a) - boxTop;
+    return maxLightY;                                  // height of the searched part
+  }
   // The aim line can be moved with the two arrows on the picture; kept separately for the phone
   // upright and on its side.
   const aimSet = { p: null, l: null };
@@ -1085,30 +1105,36 @@ if (typeof document !== 'undefined') (function () {
   function placeGrip() {
     if (!video.videoWidth) return;
     const v = shownVideo();
-    $('aimGrip').style.top = (v.top + v.h * aimFrac(video.videoWidth, video.videoHeight, aimSet[aimKey()])) + 'px';
+    const k = aimKey(), vw = video.videoWidth, fullH = video.videoHeight;
+    $('aimGrip').style.top = (v.top + v.h * aimFrac(vw, fullH, aimSet[k])) + 'px';
+    $('topGrip').style.top = (v.top + v.h * boxTopFrac(vw, fullH, aimSet[k], topSet[k])) + 'px';
   }
-  let lastDraw = null, dragging = false;
+  let lastDraw = null, dragging = false;      // dragging: false, 'aim' or 'top'
   function dragAim(e) {
     if (!dragging || !video.videoWidth) return;
     e.preventDefault();
-    const v = shownVideo(), k = aimKey();
-    aimSet[k] = Math.max(0.15, Math.min(0.8, (e.clientY - v.stageTop - v.top) / v.h));
+    const v = shownVideo(), k = aimKey(), f = (e.clientY - v.stageTop - v.top) / v.h;
+    if (dragging === 'aim') aimSet[k] = Math.max(0.15, Math.min(0.8, f));
+    else topSet[k] = Math.max(0, Math.min(aimFrac(video.videoWidth, video.videoHeight, aimSet[k]) - 0.1, f));
     placeGrip();
     if (lastDraw) {                                   // redraw now, without waiting for the next look
-      const vw = video.videoWidth, fullH = video.videoHeight;
-      maxLightY = lightMaxY(vw, fullH, aimSet[k]); aimPx = aimY(vw, fullH, aimSet[k]);
+      setGeometry(video.videoWidth, video.videoHeight);
       drawOverlay(lastDraw.vw, lastDraw.vh, lastDraw.open, lastDraw.fullH);
     }
   }
-  const grip = $('aimGrip');
-  grip.addEventListener('pointerdown', e => { dragging = true; try { grip.setPointerCapture(e.pointerId); } catch (err) {} e.preventDefault(); });
-  grip.addEventListener('pointermove', dragAim);
-  const endDrag = () => {
+  for (const [id, what] of [['aimGrip', 'aim'], ['topGrip', 'top']]) {
+    const g = $(id);
+    g.addEventListener('pointerdown', e => { dragging = what; try { g.setPointerCapture(e.pointerId); } catch (err) {} e.preventDefault(); });
+    g.addEventListener('pointermove', dragAim);
+    g.addEventListener('pointerup', () => endDrag()); g.addEventListener('pointercancel', () => endDrag());
+  }
+  function endDrag() {
     if (!dragging) return; dragging = false;
-    const k = aimKey(); try { localStorage.setItem('ctw-aim-' + k, aimSet[k].toFixed(3)); } catch (e) {}
-    tlY = null; log('Aim line at ' + Math.round(aimSet[k] * 100) + '% of the picture height.');
-  };
-  grip.addEventListener('pointerup', endDrag); grip.addEventListener('pointercancel', endDrag);
+    const k = aimKey();
+    try { if (aimSet[k] != null) localStorage.setItem('ctw-aim-' + k, aimSet[k].toFixed(3)); localStorage.setItem('ctw-top-' + k, topSet[k].toFixed(3)); } catch (e) {}
+    tlY = null; S.boxes = []; S.signBoxes = []; S.cars = []; S.greens = [];   // positions were counted from the old box
+    log('Box from ' + Math.round(boxTopFrac(video.videoWidth, video.videoHeight, aimSet[k], topSet[k]) * 100) + '% to ' + Math.round((boxTop + maxLightY) / video.videoHeight * 100) + '% of the picture height.');
+  }
   window.addEventListener('resize', placeGrip);
   function learnSignal() {
     if (!S.lastFix || S.heading == null || S.test) return;
@@ -1123,10 +1149,9 @@ if (typeof document !== 'undefined') (function () {
     let idle = false;
     try {
       if (S.model && S.camera && video.readyState >= 2 && video.videoWidth) {
-        const vw = video.videoWidth, fullH = video.videoHeight, aim = aimSet[aimKey()], vh = viewHeight(vw, fullH, aim), open = gateInfo().open, now = Date.now();
-        maxLightY = lightMaxY(vw, fullH, aim); aimPx = aimY(vw, fullH, aim);
+        const vw = video.videoWidth, fullH = video.videoHeight, vh = setGeometry(vw, fullH), open = gateInfo().open, now = Date.now();
         if (frameC.width !== vw || frameC.height !== vh) { frameC.width = vw; frameC.height = vh; }
-        fctx.drawImage(video, 0, 0, vw, vh, 0, 0, vw, vh);         // freeze one frame for this look (the searched part)
+        fctx.drawImage(video, 0, boxTop, vw, vh, 0, 0, vw, vh);         // freeze one frame for this look (the searched part)
         turn++;
         const follow = now < signFollow;
         // The speed limit now comes from the map first, so most looks go to traffic lights: three in
@@ -1179,7 +1204,7 @@ if (typeof document !== 'undefined') (function () {
     clearInterval(renderTimer); if (watchId != null) navigator.geolocation.clearWatch(watchId); watchId = null;
     stopCamera(); S.hist = []; S.boxes = []; S.signBoxes = []; S.signReads = []; S.greenAt = 0; S.greens = []; S.cars = []; S.camLight = 'none'; S.gpsSpeed = null;
     if (wake) { try { wake.release(); } catch (e) {} wake = null; }
-    $('stageMsg').classList.remove('hide'); $('stageMsg').textContent = 'Stopped. Press Start to run again.'; $('aimGrip').classList.add('hide');
+    $('stageMsg').classList.remove('hide'); $('stageMsg').textContent = 'Stopped. Press Start to run again.'; $('aimGrip').classList.add('hide'); $('topGrip').classList.add('hide');
     render();
   }
   // Coming back from another app: the phone stops the camera, GPS and sound of a page that is not on
@@ -1252,7 +1277,7 @@ if (typeof document !== 'undefined') (function () {
   $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
   // Version shown on the page, and a check for a newer one on the site. version.json holds the
   // newest version; when it differs from this page's, a button offers the update.
-  const APP_VERSION = '2026-11-20 09:20', APP_NOTE = 'Only the box on the camera picture is searched now. Drag the round handle to move the aim line and the box.';
+  const APP_VERSION = '2026-11-20 14:30', APP_NOTE = 'The top of the box can be dragged down too (white handle on the left), to keep lights on buildings out.';
   $('verInfo').textContent = 'Version: ' + APP_VERSION + '. ' + APP_NOTE;
   let newVersion = null;
   async function checkVersion() {
