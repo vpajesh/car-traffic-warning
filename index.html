@@ -17,6 +17,9 @@
   #stage { position: relative; background: #000; border-radius: 12px; overflow: hidden;
     aspect-ratio: 4 / 3; border: 1px solid var(--line); }
   #stage video, #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #aimGrip { position: absolute; right: 4px; width: 52px; height: 52px; margin-top: -26px; border-radius: 50%; z-index: 3; display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.6); color: #ffd60a; border: 2px solid rgba(255,214,10,0.85); font-size: 26px; touch-action: none; user-select: none; -webkit-user-select: none; cursor: ns-resize; }
+  #aimGrip.hide { display: none; }
   #stageMsg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     text-align: center; padding: 20px; color: var(--dim); font-size: 14px; }
   #banner { margin: 10px 0; border-radius: 12px; padding: 14px; text-align: center;
@@ -70,6 +73,7 @@
   <div id="stage">
     <video id="video" playsinline muted autoplay></video>
     <canvas id="overlay"></canvas>
+    <div id="aimGrip" class="hide" role="slider" aria-label="Drag to move the aim line">&#8597;</div>
     <div id="stageMsg">Mount the phone so the rear camera faces the road, then press Start.</div>
   </div>
 
@@ -364,6 +368,16 @@ function trackRegion(b, vw, vh) {
   return [x / vw, y / vh, w / vw, h / vh];
 }
 
+// Lamps on a vehicle are not signals: brake lights and tail lights of the cars ahead. The same
+// detector also finds cars, motorcycles, buses and trucks, so a "traffic light" whose centre lies
+// on one of them is dropped. The top 15% of the vehicle's box is left out, because a real signal
+// behind a tall vehicle can overlap its roof line.
+const VEHICLE_CLASSES = [2, 3, 5, 7];
+function onVehicle(b, vehicles) {
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  return vehicles.some(v => cx >= v.x && cx <= v.x + v.w && cy >= v.y + v.h * 0.15 && cy <= v.y + v.h);
+}
+
 // Colour of the lit lamp inside a box the detector called a traffic light.
 // Tuned on night dashcam footage: a real red lamp has a core of strongly saturated red, while shop
 // signs, street lamp glare and reflective road posts are paler. Yellow is accepted only as the
@@ -417,9 +431,9 @@ function afterGreen(colour, msSinceGreen, changed) {
   return (colour === 'red' || colour === 'yellow') && msSinceGreen < GREEN_GRACE_MS && !changed ? 'none' : colour;
 }
 // box: the red/yellow lamp picked now. greens: green lamps seen lately [{x, y, w, h, t}].
-// True when a green was at this place within the last 2.5 s and none has been seen for 0.8 s.
+// True when a green was at this place within the last 2.5 s and none has been seen for 0.5 s.
 function signalChanged(box, greens, now) {
-  if (!box || greens.some(g => now - g.t < 800)) return false;
+  if (!box || greens.some(g => now - g.t < 500)) return false;
   const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
   return greens.some(g => now - g.t <= 2500 && Math.hypot(g.x + g.w / 2 - cx, g.y + g.h / 2 - cy) < 2 * Math.max(box.h, g.h, box.w, g.w));
 }
@@ -440,13 +454,15 @@ function nearSignal(pos, heading, signals, radius) {
 
 // The part of the camera picture that is searched. A phone held upright sees the road only in the
 // top part and the dashboard below, so only the top 65% is used. Returns the height to use.
-function viewHeight(vw, vh) { return vh > vw * 1.2 ? Math.round(vh * 0.65) : vh; }
+// a: where the driver has put the aim line, as a share of the picture height (null = not moved).
+function aimFrac(vw, fullH, a) { return a != null ? a : fullH > vw * 1.2 ? 0.45 : 0.5; }
+function viewHeight(vw, vh, a) { return vh > vw * 1.2 ? Math.round(vh * Math.min(1, aimFrac(vw, vh, a) + 0.2)) : vh; }
 // Lamps lower in the picture than this are not signals (brake lights, reflections on the bonnet).
 // Depends on how the phone is aimed, so it is kept generous: with the phone upright the horizon
 // has been seen anywhere from 10% to 50% of the way down.
 // Where the far end of the road should sit in the picture: the aim line drawn on the screen.
-function aimY(vw, fullH) { return fullH * (fullH > vw * 1.2 ? 0.45 : 0.5); }
-function lightMaxY(vw, fullH) { return fullH * (fullH > vw * 1.2 ? 0.58 : 0.62); }
+function aimY(vw, fullH, a) { return fullH * aimFrac(vw, fullH, a); }
+function lightMaxY(vw, fullH, a) { return fullH * Math.min(1, aimFrac(vw, fullH, a) + (fullH > vw * 1.2 ? 0.13 : 0.12)); }
 
 // A point `metres` ahead of pos along heading (degrees). Used to save a signal that was seen ahead.
 function pointAhead(pos, heading, metres) {
@@ -468,12 +484,15 @@ function zoomPatch(vw, vh, cx, cy, k, n) {
 // Zoomed looks for traffic lights: a grid of full-sharpness patches over the upper part of the
 // picture, where signals appear. Returns rows of patches (top row first), each row centre patch first.
 // A normal picture gets one patch; a 4K picture gets two rows of two or three.
-function zoomGrid(vw, vh) {
+function zoomGrid(vw, vh, aimPx) {
   const cols = zoomCount(vw, 0.45), rows = vh > vw ? 2 : Math.max(1, Math.round(0.5 * vh / NET)), h = Math.min(1, NET / vh), grid = [];
   const order = []; for (let k = 0; k < cols; k++) order.push(k);
   const mid = (cols - 1) / 2; order.sort((a, b) => Math.abs(a - mid) - Math.abs(b - mid));
   for (let r = 0; r < rows; r++) {
-    const cy = rows === 1 ? 0.38 : Math.min(1 - h / 2, 0.02 + h / 2 + r * h);
+    // With the aim line known, the first row sits on it (three quarters above the line, where far
+    // signals are, one quarter below); a second row is stacked above. Without it, fixed places.
+    const cy = aimPx != null ? Math.max(h / 2, Math.min(1 - h / 2, (aimPx - 0.25 * NET) / vh - r * h))
+      : rows === 1 ? 0.38 : Math.min(1 - h / 2, 0.02 + h / 2 + r * h);
     grid.push(order.map(k => zoomPatch(vw, vh, 0.5, cy, k, cols)));
   }
   return grid;
@@ -572,7 +591,7 @@ if (typeof document !== 'undefined') (function () {
   const S = {
     running: false, camera: false, model: null,
     gpsSpeed: null, gpsAt: 0, lastFix: null, gpsAcc: null,
-    hist: [], camLight: 'none', boxes: [], passMs: 0, greenAt: 0, greens: [],
+    hist: [], camLight: 'none', boxes: [], cars: [], passMs: 0, greenAt: 0, greens: [],
     signModel: null, signClasses: [], signValues: [], ocr: null, signReady: false, signReads: [], signLimit: null, signBoxes: [],
     gate: 'near', mapSignals: [], marks: [], sigAt: null, sigTry: 0, sigBusy: false, sigState: 'not loaded yet',
     manualLimit: null, mapLimit: null, mapRoad: null, mapSrc: 'map', ttKey: '', ttError: false, heading: null, headFix: null, lastLookup: null, overSince: 0, underAt: 0, noLimit: 0, lookupBusy: false,
@@ -890,7 +909,7 @@ if (typeof document !== 'undefined') (function () {
   async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('no camera access');
     video.srcObject = await openChosenCamera(); await video.play();
-    S.camera = true; $('stageMsg').classList.add('hide');
+    S.camera = true; $('stageMsg').classList.add('hide'); $('aimGrip').classList.remove('hide');
     fitStage();
   }
   function fitStage() {
@@ -927,12 +946,12 @@ if (typeof document !== 'undefined') (function () {
   let tlY = null;      // where signals have been seen, as a share of the picture height (kept between drives)
   try { const v = parseFloat(localStorage.getItem('ctw-tly')); if (v >= 0 && v <= 1) tlY = v; } catch (e) {}
   function nextLightLook(step, vw, vh) {
-    const grid = zoomGrid(vw, vh), many = grid.length * grid[0].length > 1;
+    const grid = zoomGrid(vw, vh, aimPx), many = grid.length * grid[0].length > 1;
     // one patch: every third look is zoomed. Several patches (4K): two looks in three are zoomed.
     const zoomed = many ? step % 3 !== 0 : step % 3 === 0;
     if (!zoomed) { const w = many ? Math.floor(step / 3) : step - Math.floor(step / 3) - 1; return WIDE_LOOKS[w % WIDE_LOOKS.length]; }
     const z = many ? step - Math.floor(step / 3) - 1 : step / 3;
-    const fav = tlY == null ? -1 : grid.findIndex(row => tlY >= row[0][1] && tlY <= row[0][1] + row[0][3]);
+    const fav = Math.max(0, tlY == null ? 0 : grid.findIndex(row => tlY >= row[0][1] && tlY <= row[0][1] + row[0][3]));   // row on the aim line unless signals have been seen higher
     return zoomPick(grid, z, fav);
   }
   let lightStep = 0, lightTrack = null, lightTrackUntil = 0;   // lightTrack: the area around a signal that was just seen
@@ -941,9 +960,14 @@ if (typeof document !== 'undefined') (function () {
     const tracking = lightTrack && Date.now() < lightTrackUntil && lightStep % 3 !== 0;
     const { o, reg, lb } = await runNet(S.model, tracking ? lightTrack : nextLightLook(lightStep, vw, vh), vw, vh), now = Date.now(), found = [];
     lightStep++;
-    for (const d of decodeClasses(o.data, o.dims[2], [TL_CLASS], reg, lb, 0.2)) {
+    const dets = decodeClasses(o.data, o.dims[2], [TL_CLASS].concat(VEHICLE_CLASSES), reg, lb, 0.2);
+    // vehicles seen in the last 1.5 s (a zoomed look may show only part of a car, so earlier wide looks count too)
+    S.cars = S.cars.filter(v => now - v.t < 1500).concat(dets.filter(d => d.cls !== TL_CLASS && d.score >= 0.35).map(d => ({ x: d.x, y: d.y, w: d.w, h: d.h, t: now })));
+    for (const d of dets) {
+      if (d.cls !== TL_CLASS) continue;
       const b = clampBox(d, vw, vh); if (b.w < 3 || b.h < 3) continue;
-      b.score = d.score; b.t = now; b.colour = lampColour(fctx.getImageData(b.x, b.y, b.w, b.h).data, b.w, b.h);
+      b.score = d.score; b.t = now;
+      b.colour = onVehicle(b, S.cars) ? 'none' : lampColour(fctx.getImageData(b.x, b.y, b.w, b.h).data, b.w, b.h);   // a lamp on a vehicle is not a signal
       found.push(b);
     }
     // keep recent boxes from the parts not searched this time
@@ -957,8 +981,14 @@ if (typeof document !== 'undefined') (function () {
     const best = pickLightBox(S.boxes, vh, S.minBox, vw, maxLightY), seen = best ? best.colour : 'none';
     if (seen === 'green') S.greenAt = now;
     S.greens = S.greens.filter(g => now - g.t <= 2500).concat(found.filter(b => b.colour === 'green'));
-    const colour = afterGreen(seen, now - S.greenAt, signalChanged(best, S.greens, now));
-    if (colour !== 'none') S.hist.push({ t: now, colour });
+    const changed = signalChanged(best, S.greens, now);
+    const colour = afterGreen(seen, now - S.greenAt, changed);
+    if (colour !== 'none') {
+      S.hist.push({ t: now, colour });
+      // A lamp turning yellow or red where a green one just was is strong evidence by itself, and
+      // yellow lasts only about 3 seconds: it counts as two sightings, so the alarm is not held back.
+      if (changed && colour !== 'green') S.hist.push({ t: now, colour });
+    }
   }
 
   // Speed limit boards: zoomed right, right half, zoomed left, left half, whole view in turn. The zoomed
@@ -1005,17 +1035,18 @@ if (typeof document !== 'undefined') (function () {
   }
 
   function drawOverlay(vw, vh, open, fullH) {
+    lastDraw = { vw, vh, open, fullH }; if (!dragging) placeGrip();
     if (overlay.width !== vw || overlay.height !== fullH) { overlay.width = vw; overlay.height = fullH; }
     const lw = Math.max(2, vw / 320), now = Date.now();
     octx.clearRect(0, 0, vw, fullH);
     // Aim guide: the dashed box is where signals are looked for; the line is where the far end of
     // the road should sit. The phone is aimed so that the road's far end touches the line.
-    const ay = aimY(vw, fullH), gx = vw * 0.04, gy = fullH * 0.04, fs = Math.round(Math.min(vw, fullH) / 28);
+    const ay = aimPx, gx = vw * 0.04, gy = fullH * 0.04, fs = Math.round(Math.min(vw, fullH) / 28);
     octx.save(); octx.setLineDash([lw * 5, lw * 4]); octx.lineWidth = lw; octx.strokeStyle = 'rgba(255,255,255,0.75)';
     octx.strokeRect(gx, gy, vw - 2 * gx, maxLightY - gy);
     octx.setLineDash([]); octx.strokeStyle = 'rgba(255,214,10,0.9)'; octx.beginPath(); octx.moveTo(gx, ay); octx.lineTo(vw - gx, ay); octx.stroke();
     octx.font = '600 ' + fs + 'px system-ui, sans-serif'; octx.fillStyle = 'rgba(255,214,10,0.95)'; octx.textBaseline = 'bottom';
-    octx.fillText('Far end of road on this line', gx + lw * 3, ay - lw * 2);
+    octx.fillText('Far end of road here', gx + lw * 3, ay - lw * 2);
     octx.fillStyle = 'rgba(255,255,255,0.85)'; octx.textBaseline = 'top'; octx.fillText('Signals inside this box', gx + lw * 3, gy + lw * 3);
     octx.restore();
     for (const b of S.boxes) {
@@ -1036,7 +1067,46 @@ if (typeof document !== 'undefined') (function () {
   // in three for 2 seconds after a board was found). Away from known signals the red light is still
   // watched: one look in three, two in three for 3 seconds after a lit signal was seen, and the
   // alarm needs three sightings. A red seen for 3 seconds there is saved as a signal on this phone.
-  let turn = 0, lightFollow = 0, redSince = 0, maxLightY = 0;
+  let turn = 0, lightFollow = 0, redSince = 0, maxLightY = 0, aimPx = 0;
+  // The aim line can be moved with the two arrows on the picture; kept separately for the phone
+  // upright and on its side.
+  const aimSet = { p: null, l: null };
+  try { for (const k of ['p', 'l']) { const v = parseFloat(localStorage.getItem('ctw-aim-' + k)); if (v >= 0.15 && v <= 0.8) aimSet[k] = v; } } catch (e) {}
+  const aimKey = () => video.videoHeight > video.videoWidth * 1.2 ? 'p' : 'l';
+  // The round grip at the right end of the line is dragged with a finger; the line, the box and the
+  // searched area follow at once. Where the picture sits inside the camera frame (it is letterboxed):
+  function shownVideo() {
+    const r = $('stage').getBoundingClientRect(), vw = video.videoWidth, vh = video.videoHeight, k = Math.min(r.width / vw, r.height / vh);
+    return { top: (r.height - vh * k) / 2, h: vh * k, stageTop: r.top };
+  }
+  function placeGrip() {
+    if (!video.videoWidth) return;
+    const v = shownVideo();
+    $('aimGrip').style.top = (v.top + v.h * aimFrac(video.videoWidth, video.videoHeight, aimSet[aimKey()])) + 'px';
+  }
+  let lastDraw = null, dragging = false;
+  function dragAim(e) {
+    if (!dragging || !video.videoWidth) return;
+    e.preventDefault();
+    const v = shownVideo(), k = aimKey();
+    aimSet[k] = Math.max(0.15, Math.min(0.8, (e.clientY - v.stageTop - v.top) / v.h));
+    placeGrip();
+    if (lastDraw) {                                   // redraw now, without waiting for the next look
+      const vw = video.videoWidth, fullH = video.videoHeight;
+      maxLightY = lightMaxY(vw, fullH, aimSet[k]); aimPx = aimY(vw, fullH, aimSet[k]);
+      drawOverlay(lastDraw.vw, lastDraw.vh, lastDraw.open, lastDraw.fullH);
+    }
+  }
+  const grip = $('aimGrip');
+  grip.addEventListener('pointerdown', e => { dragging = true; try { grip.setPointerCapture(e.pointerId); } catch (err) {} e.preventDefault(); });
+  grip.addEventListener('pointermove', dragAim);
+  const endDrag = () => {
+    if (!dragging) return; dragging = false;
+    const k = aimKey(); try { localStorage.setItem('ctw-aim-' + k, aimSet[k].toFixed(3)); } catch (e) {}
+    tlY = null; log('Aim line at ' + Math.round(aimSet[k] * 100) + '% of the picture height.');
+  };
+  grip.addEventListener('pointerup', endDrag); grip.addEventListener('pointercancel', endDrag);
+  window.addEventListener('resize', placeGrip);
   function learnSignal() {
     if (!S.lastFix || S.heading == null || S.test) return;
     const p = pointAhead(S.lastFix, S.heading, 60);
@@ -1050,8 +1120,8 @@ if (typeof document !== 'undefined') (function () {
     let idle = false;
     try {
       if (S.model && S.camera && video.readyState >= 2 && video.videoWidth) {
-        const vw = video.videoWidth, fullH = video.videoHeight, vh = viewHeight(vw, fullH), open = gateInfo().open, now = Date.now();
-        maxLightY = lightMaxY(vw, fullH);
+        const vw = video.videoWidth, fullH = video.videoHeight, aim = aimSet[aimKey()], vh = viewHeight(vw, fullH, aim), open = gateInfo().open, now = Date.now();
+        maxLightY = lightMaxY(vw, fullH, aim); aimPx = aimY(vw, fullH, aim);
         if (frameC.width !== vw || frameC.height !== vh) { frameC.width = vw; frameC.height = vh; }
         fctx.drawImage(video, 0, 0, vw, vh, 0, 0, vw, vh);         // freeze one frame for this look (the searched part)
         turn++;
@@ -1104,9 +1174,9 @@ if (typeof document !== 'undefined') (function () {
   function stop() {
     S.running = false; $('startBtn').textContent = 'Start'; $('startBtn').classList.remove('stop');
     clearInterval(renderTimer); if (watchId != null) navigator.geolocation.clearWatch(watchId); watchId = null;
-    stopCamera(); S.hist = []; S.boxes = []; S.signBoxes = []; S.signReads = []; S.greenAt = 0; S.greens = []; S.camLight = 'none'; S.gpsSpeed = null;
+    stopCamera(); S.hist = []; S.boxes = []; S.signBoxes = []; S.signReads = []; S.greenAt = 0; S.greens = []; S.cars = []; S.camLight = 'none'; S.gpsSpeed = null;
     if (wake) { try { wake.release(); } catch (e) {} wake = null; }
-    $('stageMsg').classList.remove('hide'); $('stageMsg').textContent = 'Stopped. Press Start to run again.';
+    $('stageMsg').classList.remove('hide'); $('stageMsg').textContent = 'Stopped. Press Start to run again.'; $('aimGrip').classList.add('hide');
     render();
   }
   // Coming back from another app: the phone stops the camera, GPS and sound of a page that is not on
@@ -1179,7 +1249,7 @@ if (typeof document !== 'undefined') (function () {
   $('distSel').addEventListener('change', e => { S.minBox = Number(e.target.value); });
   // Version shown on the page, and a check for a newer one on the site. version.json holds the
   // newest version; when it differs from this page's, a button offers the update.
-  const APP_VERSION = '2026-11-18 18:40', APP_NOTE = 'Softer alarm sound (Settings: Alarm sound). Speed alarm asks the map again before beeping, so joining a faster road does not beep on the old limit.';
+  const APP_VERSION = '2026-11-20 08:55', APP_NOTE = 'Drag the round handle on the camera picture to move the yellow aim line. Lamps on vehicles (brake lights) are no longer taken as signals.';
   $('verInfo').textContent = 'Version: ' + APP_VERSION + '. ' + APP_NOTE;
   let newVersion = null;
   async function checkVersion() {
